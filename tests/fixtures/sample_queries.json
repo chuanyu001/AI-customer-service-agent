@@ -1,0 +1,34 @@
+{
+  "knowledge_queries": [
+    {"query": "极目设备离线了怎么办", "expected_intent": "knowledge_query", "expected_category": "故障排查"},
+    {"query": "怎么查询SIM卡号和终端号", "expected_intent": "knowledge_query", "expected_category": "设备信息"},
+    {"query": "设备怎么重启", "expected_intent": "knowledge_query"},
+    {"query": "如何导出记录仪视频", "expected_intent": "knowledge_query"},
+    {"query": "SIM卡怎么拔插", "expected_intent": "knowledge_query"},
+    {"query": "设备密码是多少", "expected_intent": "knowledge_query"},
+    {"query": "超速预警参数是什么", "expected_intent": "knowledge_query"},
+    {"query": "设备怎么续费", "expected_intent": "knowledge_query"}
+  ],
+  "live_queries": [
+    {"query": "帮我查一下SIM卡号是多少", "expected_intent": "live_query", "expected_query_type": "QRY001"},
+    {"query": "我的终端号是什么", "expected_intent": "live_query", "expected_query_type": "QRY002"},
+    {"query": "设备在线状态怎么样", "expected_intent": "live_query", "expected_query_type": "QRY010"},
+    {"query": "查询流量套餐", "expected_intent": "live_query", "expected_query_type": "QRY013"}
+  ],
+  "transfer_requests": [
+    {"query": "我要转人工", "expected_intent": "transfer_request"},
+    {"query": "转人工客服", "expected_intent": "transfer_request"},
+    {"query": "找人工", "expected_intent": "transfer_request"},
+    {"query": "我要找客服", "expected_intent": "transfer_request"}
+  ],
+  "greetings": [
+    {"query": "你好", "expected_intent": "greeting"},
+    {"query": "在吗", "expected_intent": "greeting"},
+    {"query": "hello", "expected_intent": "greeting"}
+  ],
+  "high_risk": [
+    {"query": "我要投诉你们", "expected_transfer": true, "reason_type": "risk"},
+    {"query": "退款", "expected_transfer": true, "reason_type": "risk"},
+    {"query": "我要打12315", "expected_transfer": true, "reason_type": "risk"}
+  ]
+}

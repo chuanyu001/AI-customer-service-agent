@@ -1,0 +1,140 @@
+# FastAPI 应用入口
+
+import logging
+from contextlib import asynccontextmanager
+from pathlib import Path
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from app.core.config import settings
+from app.core.database import init_db, close_db
+from app.core.redis_client import close_redis
+from app.api import chat, knowledge, evaluation, admin
+
+# 日志配置
+logging.basicConfig(
+    level=logging.DEBUG if settings.DEBUG else logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期管理"""
+    # 启动
+    logger.info("🚀 启动 AI客服Agent 服务...")
+    logger.info(f"   LLM Provider: {settings.LLM_PROVIDER} ({settings.LLM_MODEL})")
+    logger.info(f"   Database: {settings.MYSQL_HOST}:{settings.MYSQL_PORT}/{settings.MYSQL_DATABASE}")
+
+    try:
+        await init_db()
+        logger.info("✅ 数据库初始化完成")
+    except Exception as e:
+        logger.warning(f"⚠️ 数据库初始化失败 (可手动运行 scripts/init_db.py): {e}")
+
+    yield
+
+    # 关闭
+    logger.info("👋 关闭服务...")
+    await close_db()
+    await close_redis()
+
+
+# 创建应用
+app = FastAPI(
+    title=settings.APP_NAME,
+    description="AI智能客服Agent — 覆盖行车记录仪/WiFi/流量/加油四大业务领域",
+    version=settings.APP_VERSION,
+    lifespan=lifespan,
+    docs_url="/docs",
+    redoc_url="/redoc",
+)
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 注册路由
+app.include_router(chat.router, prefix="/api/v1")
+app.include_router(knowledge.router, prefix="/api/v1")
+app.include_router(evaluation.router, prefix="/api/v1")
+app.include_router(admin.router, prefix="/api/v1")
+
+
+# ============================================
+# 前端静态页面托管 (H5 聊天页)
+# ============================================
+# 前端目录: 项目根/frontend/h5-chat/
+# 访问 http://localhost:8000/ 即聊天页; http://localhost:8000/docs 为 API 文档
+# index.html 中引用 css/style.css 与 js/*.js 为根相对路径, 故将子目录分别挂载
+_FRONTEND_DIR = Path(__file__).resolve().parent.parent.parent / "frontend" / "h5-chat"
+if _FRONTEND_DIR.exists():
+    _CSS_DIR = _FRONTEND_DIR / "css"
+    _JS_DIR = _FRONTEND_DIR / "js"
+    if _CSS_DIR.exists():
+        app.mount("/css", StaticFiles(directory=str(_CSS_DIR)), name="css")
+    if _JS_DIR.exists():
+        app.mount("/js", StaticFiles(directory=str(_JS_DIR)), name="js")
+    logger.info(f"📁 前端静态目录已挂载: {_FRONTEND_DIR}")
+
+
+# ============================================
+# 全局异常处理
+# ============================================
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"未处理异常: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "code": 500,
+            "message": f"服务器内部错误: {str(exc)}",
+            "data": None,
+        },
+    )
+
+
+# ============================================
+# 根路由 — 返回 H5 聊天页
+# ============================================
+
+from fastapi.responses import FileResponse
+
+_INDEX_HTML = _FRONTEND_DIR / "index.html"
+
+
+@app.get("/")
+async def root():
+    """根路由: 返回 H5 聊天页 (存在时), 否则返回服务信息"""
+    if _INDEX_HTML.exists():
+        return FileResponse(str(_INDEX_HTML))
+    return {
+        "name": settings.APP_NAME,
+        "version": settings.APP_VERSION,
+        "docs": "/docs",
+        "health": "/health",
+    }
+
+
+@app.get("/health")
+async def health():
+    """健康检查"""
+    return {"status": "ok", "service": settings.APP_NAME, "version": settings.APP_VERSION}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "app.main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=settings.DEBUG,
+    )

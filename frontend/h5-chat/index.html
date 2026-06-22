@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>AI客服助手</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <div id="app">
+        <!-- 顶部导航 -->
+        <header class="header">
+            <span class="header-title">AI客服助手</span>
+            <span class="header-status" id="statusDot">● 在线</span>
+        </header>
+
+        <!-- 消息列表 -->
+        <main class="chat-container" id="chatContainer">
+            <!-- 欢迎语 -->
+            <div class="message assistant">
+                <div class="avatar ai-avatar">AI</div>
+                <div class="bubble">
+                    <div class="bubble-content">您好! 我是AI客服助手, 请问有什么可以帮您的?</div>
+                </div>
+            </div>
+
+            <!-- FAQ卡片区域 -->
+            <div class="faq-section" id="faqSection">
+                <div class="faq-title">常见问题</div>
+                <div class="faq-cards" id="faqCards"></div>
+            </div>
+        </main>
+
+        <!-- 追问建议 -->
+        <div class="follow-up" id="followUp" style="display:none;">
+            <div class="follow-up-title">您可能还想问:</div>
+            <div class="follow-up-list" id="followUpList"></div>
+        </div>
+
+        <!-- 评价区域 -->
+        <div class="evaluation" id="evaluation" style="display:none;">
+            <span>这个回答有帮助吗?</span>
+            <button class="eval-btn helpful" data-helpful="true">👍 有帮助</button>
+            <button class="eval-btn unhelpful" data-helpful="false">👎 没帮助</button>
+        </div>
+
+        <!-- 输入区 -->
+        <footer class="input-area">
+            <button class="upload-btn" id="uploadBtn" title="上传图片识别VIN">📷</button>
+            <input type="file" id="imageInput" accept="image/*" style="display:none">
+            <input type="text" id="messageInput" placeholder="请输入您的问题..." autocomplete="off">
+            <button class="send-btn" id="sendBtn">发送</button>
+        </footer>
+    </div>
+
+    <script src="js/api.js"></script>
+    <script src="js/chat.js"></script>
+</body>
+</html>

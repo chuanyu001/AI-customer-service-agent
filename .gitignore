@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# 虚拟环境
+venv/
+.venv/
+env/
+ENV/
+
+# 环境变量 (含密钥, 禁止提交)
+.env
+.env.local
+.env.*.local
+
+# 日志和临时文件
+*.log
+_server.log
+_*.json
+_*.txt
+tmp/
+temp/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 数据库文件 (本地SQLite, 如有)
+*.db
+*.sqlite3
+
+# pytest缓存
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Excel临时锁文件
+~$*.xlsx
+~$*.xls
+
+# Claude Code 会话配置
+.claude/
