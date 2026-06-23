@@ -1,23 +1,23 @@
 # 节点5: 数据库查询
-# 运营平台精确查询 → 字段映射 → 结果格式化
+# 通过运营平台接口(batchVehicleInfo)实时查询设备信息 → 字段映射 → 结果格式化
+# 不再使用本地 operational_device 表, 改为调接口 (data_source=platform_api)
 
 from typing import List, Dict, Any, Optional
-from sqlalchemy import select, or_
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from ..graph.state import WorkflowState
-from ..models import OperationalDevice, FieldDictionary, QueryIntentConfig
+from ..models import FieldDictionary, QueryIntentConfig
+from ..integrations.platform_client import platform_client
 
 
 async def database_query_node(state: WorkflowState) -> WorkflowState:
     """数据库查询节点
 
     处理流程:
-    1. 获取查询类型编码和已收集槽位
-    2. 构建SQL查询条件
-    3. 查询 operational_device 表
-    4. 字段名映射 (后端 → 用户友好名)
-    5. 过滤内部字段 (can_show_customer=0)
-    6. 记录查询日志
+    1. 获取查询类型编码和已收集槽位(VIN)
+    2. 调运营平台接口 batchVehicleInfo 实时查询
+    3. 字段名映射 (后端 → 用户友好名, 复用 field_dictionary)
+    4. 过滤内部字段 (can_show_customer=0)
     """
     query_type_code = state.get("query_type_code", "")
     collected_slots = state.get("collected_slots", {})
@@ -30,7 +30,7 @@ async def database_query_node(state: WorkflowState) -> WorkflowState:
     if not query_type_code or not collected_slots:
         return state
 
-    # 实际查询由 query_with_db 执行
+    # 实际查询由 database_query_with_db 执行
     return state
 
 
@@ -49,48 +49,25 @@ async def database_query_with_db(state: WorkflowState, db: AsyncSession) -> Work
 
     try:
         # ============================================
-        # Step 1: 构建查询条件
+        # Step 1: 取查询条件 (运营平台接口仅支持 VIN)
         # ============================================
-        conditions = []
-
-        # VIN
         vin = collected_slots.get("vin", "")
-        if vin:
-            conditions.append(OperationalDevice.vin == vin)
-
-        # 终端号
-        terminal_id = collected_slots.get("terminal_id", "")
-        if terminal_id:
-            conditions.append(OperationalDevice.terminal_id == terminal_id)
-
-        # SIM卡号
-        sim_iccid = collected_slots.get("sim_iccid", "")
-        if sim_iccid:
-            conditions.append(OperationalDevice.sim_iccid == sim_iccid)
-
-        # 车牌号
-        plate_number = collected_slots.get("plate_number", "")
-        if plate_number:
-            conditions.append(OperationalDevice.plate_number == plate_number)
-
-        if not conditions:
-            state["query_error"] = "缺少查询条件"
+        if not vin:
+            state["query_error"] = "缺少查询条件(VIN)"
             return state
 
         # ============================================
-        # Step 2: 执行查询
+        # Step 2: 调运营平台接口实时查询
         # ============================================
-        stmt = select(OperationalDevice).where(or_(*conditions)).limit(10)
-        result = await db.execute(stmt)
-        devices = result.scalars().all()
+        device = await platform_client.query_device_by_vin(vin)
 
-        if not devices:
+        if not device:
             state["query_result_count"] = 0
             state["query_success"] = True
             return state
 
         # ============================================
-        # Step 3: 字段映射 + 过滤
+        # Step 3: 字段映射 + 过滤 (接口返回字段名已对齐 OperationalDevice)
         # ============================================
         # 获取字段字典
         field_stmt = select(FieldDictionary).where(
@@ -111,50 +88,38 @@ async def database_query_with_db(state: WorkflowState, db: AsyncSession) -> Work
             allowed_fields = {rf.get("backend", "") for rf in config.return_fields}
 
         # 格式化结果
-        formatted_results = []
-        for device in devices:
-            item = {}
-            for col in OperationalDevice.__table__.columns:
-                field_name = col.name
-                value = getattr(device, field_name, None)
+        item = {}
+        for field_name, value in device.items():
+            # 过滤内部字段
+            if field_name in ("id", "metadata", "created_at", "updated_at"):
+                continue
 
-                # 过滤内部字段
-                if field_name in ("id", "metadata", "created_at", "updated_at"):
-                    continue
+            # 检查是否可对客展示
+            field_dict = field_dicts.get(field_name)
+            if field_dict and not field_dict.can_show_customer:
+                continue
 
-                # 检查是否可对客展示
-                field_dict = field_dicts.get(field_name)
-                if field_dict and not field_dict.can_show_customer:
-                    continue
+            # 字段名映射
+            display_name = field_dict.display_name if field_dict else field_name
 
-                # 字段名映射
-                display_name = field_dict.display_name if field_dict else field_name
+            # 允许字段过滤
+            if allowed_fields and field_name not in allowed_fields:
+                continue
 
-                # 允许字段过滤
-                if allowed_fields and field_name not in allowed_fields:
-                    continue
+            if value is not None:
+                item[display_name] = str(value)
 
-                if value is not None:
-                    item[display_name] = str(value)
-
-            if item:
-                formatted_results.append(item)
+        formatted_results = [item] if item else []
 
         state["query_result"] = formatted_results
         state["query_result_count"] = len(formatted_results)
         state["query_success"] = True
 
-        # 将查询结果中的重要信息存入 collected_slots
-        if devices:
-            device = devices[0]
-            if device.vin:
-                state["collected_slots"]["vin"] = device.vin
-            if device.terminal_id:
-                state["collected_slots"]["terminal_id"] = device.terminal_id
-            if device.sim_iccid:
-                state["collected_slots"]["sim_iccid"] = device.sim_iccid
-            if device.brand_id:
-                state["collected_slots"]["brand_id"] = device.brand_id
+        # 将查询结果中的重要信息回填 collected_slots
+        if device.get("vin"):
+            state["collected_slots"]["vin"] = device["vin"]
+        if device.get("terminal_id"):
+            state["collected_slots"]["terminal_id"] = device["terminal_id"]
 
     except Exception as e:
         state["query_success"] = False

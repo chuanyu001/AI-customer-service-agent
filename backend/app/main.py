@@ -78,10 +78,14 @@ _FRONTEND_DIR = Path(__file__).resolve().parent.parent.parent / "frontend" / "h5
 if _FRONTEND_DIR.exists():
     _CSS_DIR = _FRONTEND_DIR / "css"
     _JS_DIR = _FRONTEND_DIR / "js"
+    _VIDEOS_DIR = _FRONTEND_DIR / "videos"
     if _CSS_DIR.exists():
         app.mount("/css", StaticFiles(directory=str(_CSS_DIR)), name="css")
     if _JS_DIR.exists():
         app.mount("/js", StaticFiles(directory=str(_JS_DIR)), name="js")
+    if _VIDEOS_DIR.exists():
+        app.mount("/videos", StaticFiles(directory=str(_VIDEOS_DIR)), name="videos")
+        logger.info(f"📁 视频目录已挂载: {_VIDEOS_DIR}")
     logger.info(f"📁 前端静态目录已挂载: {_FRONTEND_DIR}")
 
 

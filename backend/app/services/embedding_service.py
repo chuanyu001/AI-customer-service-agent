@@ -32,9 +32,11 @@ class EmbeddingService:
         """惰性创建 OpenAI 兼容客户端 (火山方舟)"""
         if self._client is None:
             from openai import OpenAI
+            import httpx
             self._client = OpenAI(
                 base_url=settings.EMBEDDING_BASE_URL,
                 api_key=settings.LLM_API_KEY,
+                http_client=httpx.Client(proxy=None, timeout=30),
             )
         return self._client
 

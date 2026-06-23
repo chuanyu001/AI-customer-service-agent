@@ -53,5 +53,11 @@ htmlcov/
 ~$*.xlsx
 ~$*.xls
 
+# 视频文件 (本机验证用, 不进git, 太大)
+frontend/h5-chat/videos/
+*.mp4
+*.mov
+*.avi
+
 # Claude Code 会话配置
 .claude/

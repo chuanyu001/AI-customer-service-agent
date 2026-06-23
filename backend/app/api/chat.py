@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 from app.schemas.chat import (
@@ -190,11 +191,12 @@ async def send_message(
                 if brand_knowledge.need_attachment:
                     for att in brand_knowledge.attachments:
                         attachments.append({"type": att.file_type or "link", "url": att.file_url, "name": att.file_name})
+                reply_content = await _polish_answer(req.content, brand_knowledge)
                 ai_msg = await session_service.add_message(
                     db=db,
                     conversation_id=conv.id,
                     role="assistant",
-                    content=brand_knowledge.standard_answer,
+                    content=reply_content,
                     action="auto_reply",
                     reply_type="knowledge_answer",
                     knowledge_id=brand_knowledge.id,
@@ -208,7 +210,7 @@ async def send_message(
                         session_id=session_id,
                         message_id=ai_msg.message_id,
                         seq=ai_msg.seq,
-                        content=brand_knowledge.standard_answer,
+                        content=reply_content,
                         response_type="knowledge_answer",
                         knowledge_code=brand_knowledge.knowledge_code,
                         attachments=attachments,
@@ -217,6 +219,57 @@ async def send_message(
                     ).model_dump()
                 )
         # 未识别出品牌 → 清除pending, 走正常流程 (用户可能改问别的)
+        await session_service.clear_pending_context(db, session_id)
+
+    # VIN 收集 pending: 上一轮追问了VIN, 当前消息若含VIN, 直接调接口查询
+    if pending and pending.get("type") == "vin_collection":
+        vin = _extract_vin(req.content)
+        if vin:
+            await session_service.clear_pending_context(db, session_id)
+            from app.integrations.platform_client import platform_client
+            qtype = pending.get("query_type_code", "QRY002")
+            device = await platform_client.query_device_by_vin(vin)
+            if device:
+                lines = ["已为您查询到以下设备信息:"]
+                field_labels = {
+                    "plate_number": "车牌号",
+                    "terminal_id": "记录仪设备号",
+                    "service_expiry": "到期时间",
+                    "vin": "车架号(VIN)",
+                }
+                for f, label in field_labels.items():
+                    val = device.get(f)
+                    if val:
+                        lines.append(f"• {label}: {val}")
+                content = "\n".join(lines)
+                reply_type = "query_result"
+            else:
+                content = "未查询到该 VIN 对应的设备信息。请确认车架号(VIN)是否正确, 或联系人工客服。"
+                reply_type = "query_empty"
+
+            ai_msg = await session_service.add_message(
+                db=db,
+                conversation_id=conv.id,
+                role="assistant",
+                content=content,
+                action="query",
+                reply_type=reply_type,
+                query_type_code=qtype,
+                intent_result={"intent": "live_query", "vin": vin, "via": "vin_collection"},
+            )
+            await session_service.update_consecutive_fail(db, session_id, increment=False)
+            await db.commit()
+            return BaseResponse(
+                data=ChatMessageResponse(
+                    session_id=session_id,
+                    message_id=ai_msg.message_id,
+                    seq=ai_msg.seq,
+                    content=content,
+                    response_type="query_result",
+                    evaluation_prompt="这个回答有帮助吗?",
+                ).model_dump()
+            )
+        # 未提取到VIN → 清除pending, 走正常流程
         await session_service.clear_pending_context(db, session_id)
 
     # ============================================
@@ -388,11 +441,14 @@ async def send_message(
 
                 follow_ups = _gen_follow_ups(best)
 
+                # 受限润色: 大模型对标准答案做格式/语气优化, 不改内容
+                reply_content = await _polish_answer(req.content, best)
+
                 ai_msg = await session_service.add_message(
                     db=db,
                     conversation_id=conv.id,
                     role="assistant",
-                    content=best.standard_answer,
+                    content=reply_content,
                     action="auto_reply",
                     reply_type="knowledge_answer",
                     knowledge_id=best.id,
@@ -407,7 +463,7 @@ async def send_message(
                         session_id=session_id,
                         message_id=ai_msg.message_id,
                         seq=ai_msg.seq,
-                        content=best.standard_answer,
+                        content=reply_content,
                         response_type="knowledge_answer",
                         knowledge_code=best.knowledge_code,
                         attachments=attachments,
@@ -418,20 +474,74 @@ async def send_message(
 
     # 4.3 查询意图
     if intent_type == "live_query":
-        # 尝试槽位收集
         from app.nodes.query_judgment import _match_query_type
+        from app.integrations.platform_client import platform_client
+
         qtype = _match_query_type(req.content)
-        if qtype:
+
+        # 先尝试从用户消息提取 VIN (运营平台接口仅支持 VIN 查询)
+        vin = _extract_vin(req.content)
+
+        if qtype and vin:
+            # 有 VIN → 调运营平台接口实时查询
+            device = await platform_client.query_device_by_vin(vin)
+            if device:
+                lines = ["已为您查询到以下设备信息:"]
+                field_labels = {
+                    "plate_number": "车牌号",
+                    "terminal_id": "记录仪设备号",
+                    "service_expiry": "到期时间",
+                    "vin": "车架号(VIN)",
+                }
+                for f, label in field_labels.items():
+                    val = device.get(f)
+                    if val:
+                        lines.append(f"• {label}: {val}")
+                content = "\n".join(lines)
+                reply_type = "query_result"
+            else:
+                content = "未查询到该 VIN 对应的设备信息。请确认车架号(VIN)是否正确, 或联系人工客服。"
+                reply_type = "query_empty"
+
             ai_msg = await session_service.add_message(
                 db=db,
                 conversation_id=conv.id,
                 role="assistant",
-                content="请提供您的车架号(VIN)、车牌号、终端号或SIM卡号中的任意一项, 以便查询相关信息。",
+                content=content,
+                action="query",
+                reply_type=reply_type,
+                query_type_code=qtype,
+                intent_result={"intent": intent_type, "confidence": intent_confidence, "vin": vin},
+            )
+            await session_service.update_consecutive_fail(db, session_id, increment=False)
+            await db.commit()
+
+            return BaseResponse(
+                data=ChatMessageResponse(
+                    session_id=session_id,
+                    message_id=ai_msg.message_id,
+                    seq=ai_msg.seq,
+                    content=content,
+                    response_type="query_result",
+                ).model_dump()
+            )
+
+        if qtype:
+            # 无 VIN → 追问车架号, 并记录pending供下一轮识别VIN
+            ai_msg = await session_service.add_message(
+                db=db,
+                conversation_id=conv.id,
+                role="assistant",
+                content="请提供您的车架号(VIN), 以便查询相关信息。",
                 action="ask_info",
                 reply_type="slot_collection",
                 query_type_code=qtype,
                 intent_result={"intent": intent_type, "confidence": intent_confidence},
             )
+            await session_service.set_pending_context(db, session_id, {
+                "type": "vin_collection",
+                "query_type_code": qtype,
+            })
             await db.commit()
 
             return BaseResponse(
@@ -442,7 +552,7 @@ async def send_message(
                     content=ai_msg.content,
                     response_type="ask_slot",
                     need_more_info=True,
-                    ask_slot_prompt="请提供车架号(VIN)、车牌号、终端号或SIM卡号",
+                    ask_slot_prompt="请提供车架号(VIN)",
                 ).model_dump()
             )
 
@@ -495,6 +605,19 @@ async def send_message(
             follow_up_questions=["设备离线了怎么办?", "如何查询SIM卡号?", "转人工"],
         ).model_dump()
     )
+
+
+def _extract_vin(text: str) -> Optional[str]:
+    """从用户消息中提取 VIN 码
+
+    VIN 标准: 17 位, 字符集不含 I/O/Q (避免与 1/0/0 混淆)
+    返回首个匹配的大写 VIN, 未匹配返回 None
+    """
+    import re
+    if not text:
+        return None
+    m = re.search(r"[A-HJ-NPR-Z0-9]{17}", text.upper())
+    return m.group(0) if m else None
 
 
 def _gen_follow_ups(knowledge) -> list:
@@ -550,3 +673,32 @@ def _build_brand_prompt(knowledge) -> str:
         f"• 启明\n"
         f"• 有为"
     )
+
+
+async def _polish_answer(query: str, knowledge) -> str:
+    """获取最终回复内容 (预润色优先, 实时润色兜底)
+
+    策略:
+    1. 优先用 knowledge.polished_answer (预润色结果, 零延迟)
+    2. 没有预润色时, 若 ENABLE_POLISH=true 则实时调大模型润色 standard_answer
+    3. 关闭实时润色或润色失败, 返回 standard_answer 原文
+
+    Args:
+        query: 用户问题
+        knowledge: KnowledgeAnswer 对象 (含 standard_answer 和 polished_answer)
+    """
+    # 1. 预润色优先
+    polished = getattr(knowledge, "polished_answer", None)
+    if polished and polished.strip():
+        return polished
+
+    # 2. 没有预润色, 看是否开启实时润色
+    answer = knowledge.standard_answer
+    if not settings.ENABLE_POLISH:
+        return answer
+    try:
+        llm = get_llm()
+        return await llm.polish(query, answer)
+    except Exception as e:
+        logger.warning(f"润色异常, 返回原文: {e}")
+        return answer

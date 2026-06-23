@@ -197,35 +197,18 @@ def _match_query_type(query: str) -> Optional[str]:
 
 
 def _get_required_slots(query_type_code: str) -> List[SlotItem]:
-    """获取查询类型所需的槽位 (硬编码兜底, 数据库优先)"""
-    slot_map = {
-        "QRY001": [{"field": "vin", "display": "车架号(VIN)", "type": "string",
-                     "collect_prompt": "请提供您的车架号(VIN)、车牌号、终端号或SIM卡号中的任意一项"}],
-        "QRY002": [{"field": "vin", "display": "车架号(VIN)", "type": "string",
-                     "collect_prompt": "请提供您的车架号(VIN)、车牌号或终端号"}],
-        "QRY003": [{"field": "vin", "display": "车架号(VIN)", "type": "string",
-                     "collect_prompt": "请提供您的车架号(VIN)、车牌号、终端号或SIM卡号中的任意一项"}],
-        "QRY010": [{"field": "vin", "display": "车架号(VIN)", "type": "string",
-                     "collect_prompt": "请提供您的车架号(VIN)或终端号"}],
-        "QRY011": [{"field": "terminal_id", "display": "终端号", "type": "string",
-                     "collect_prompt": "请提供您的设备终端号"}],
-    }
+    """获取查询类型所需的槽位 (硬编码兜底, 数据库优先)
 
-    slots_cfg = slot_map.get(query_type_code, [
-        {"field": "vin", "display": "车架号(VIN)", "type": "string",
-         "collect_prompt": "请提供您的车架号(VIN)、车牌号或终端号"}
-    ])
-
-    return [SlotItem(**s) for s in slots_cfg]
+    注: 运营平台接口 batchVehicleInfo 仅支持 VIN 查询, 故所有查询类型统一只收集 VIN
+    """
+    return [SlotItem(
+        field="vin",
+        display="车架号(VIN)",
+        type="string",
+        collect_prompt="请提供您的车架号(VIN)",
+    )]
 
 
 def _generate_slot_prompt(slot: SlotItem, collected_slots: dict) -> str:
     """生成槽位询问提示语"""
-    prompt = slot.get("collect_prompt", f"请提供您的{slot.get('display', '相关信息')}")
-
-    # 如果已有部分信息, 友好提示
-    already_have = [k for k, v in collected_slots.items() if v]
-    if already_have:
-        return prompt
-
-    return f"{prompt}\n\n💡 提示: 您也可以提供车牌号、终端号或SIM卡号"
+    return slot.get("collect_prompt", f"请提供您的{slot.get('display', '相关信息')}")

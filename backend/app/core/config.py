@@ -102,6 +102,17 @@ class Settings(BaseSettings):
     SESSION_TIMEOUT_MINUTES: int = 30
     MAX_SLOT_RETRY: int = 2
 
+    # 回复润色: 大模型对知识库答案做受限润色(只调格式/语气, 不改内容)
+    ENABLE_POLISH: bool = True
+
+    # ============================================
+    # 运营平台接口 (实时查询设备信息)
+    # ============================================
+    # 默认线上地址; 内网测试容器可用环境变量覆盖为
+    # http://172.29.30.157:32706/tob/openapi/business/batchVehicleInfo
+    PLATFORM_API_URL: str = "https://dr.smartlink.com.cn/drapp/api/operate/tob/openapi/business/batchVehicleInfo"
+    PLATFORM_API_TIMEOUT: int = 15
+
     # ============================================
     # CORS
     # ============================================

@@ -21,6 +21,7 @@ class KnowledgeAnswer(Base):
     manufacturer = Column(String(128), comment="适用厂商 (通用/极目/航天/雅迅/启明/有为)")
     standard_question = Column(String(512), nullable=False, comment="标准问题")
     standard_answer = Column(Text, nullable=False, comment="标准回答")
+    polished_answer = Column(Text, comment="大模型润色后的回复(预计算, 运行时优先用此字段)")
     answer_type = Column(String(32), default="text", comment="回答类型: text/video/image/mixed")
     need_brand = Column(Boolean, default=False, comment="是否需要品牌识别 (123/144=1)")
     need_attachment = Column(Boolean, default=False, comment="是否需要附件 (15/144=1)")

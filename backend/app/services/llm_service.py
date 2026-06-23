@@ -47,6 +47,19 @@ class LLMProvider(ABC):
         """
         pass
 
+    @abstractmethod
+    async def polish(self, query: str, answer: str) -> str:
+        """对知识库标准答案做受限润色 (只调格式/语气, 不改内容)
+
+        Args:
+            query: 用户问题
+            answer: 知识库标准答案原文
+
+        Returns:
+            润色后的回复。严禁修改/删减原文的步骤、参数、数值、条件、转人工提示。
+        """
+        pass
+
     @staticmethod
     def _parse_json_response(response: str, default: Dict) -> Dict:
         """安全解析JSON响应 (基类共享, 子类通用)"""
@@ -151,6 +164,27 @@ class LocalLLMProvider(LLMProvider):
         valid_ids = {c["id"] for c in candidates}
         return [i for i in ids if i in valid_ids][:top_k]
 
+    async def polish(self, query: str, answer: str) -> str:
+        """受限润色 (逻辑同DoubaoProvider)"""
+        if not answer or not answer.strip():
+            return answer
+        system_prompt = (
+            "你是客服回复润色助手。把知识库标准答案润色成更友好易读的客服回复。\n"
+            "严禁修改/删减/增加任何步骤、参数、数值、条件、转人工提示。\n"
+            "菜单路径、按键操作、规格参数必须原样保留。不得凭空补充信息。\n"
+            "允许: 调整语气、加项目符号、分段。只返回润色后回复。"
+        )
+        try:
+            response = await self.chat([
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"用户问题: {query}\n\n标准答案:\n{answer}\n\n润色后回复:"},
+            ])
+            if response and len(response.strip()) < len(answer.strip()) * 0.5:
+                return answer
+            return response.strip() or answer
+        except Exception:
+            return answer
+
     @staticmethod
     def _parse_json_response(response: str, default: Dict) -> Dict:
         """安全解析JSON响应 (LocalLLMProvider 本地保留, 逻辑同基类)"""
@@ -177,13 +211,16 @@ class DoubaoProvider(LLMProvider):
 
     def __init__(self):
         from openai import AsyncOpenAI
+        import httpx
         if not settings.LLM_API_KEY:
             raise ValueError(
                 "DoubaoProvider 需要 LLM_API_KEY, 请在 .env 中配置火山方舟 API Key"
             )
+        # 显式禁用代理: 避免httpx读取Windows系统代理(科学上网工具开启时会导致连不上火山方舟)
         self.client = AsyncOpenAI(
             base_url=settings.LLM_BASE_URL,
             api_key=settings.LLM_API_KEY,
+            http_client=httpx.AsyncClient(proxy=None, timeout=settings.LLM_TIMEOUT),
         )
         self.model = settings.LLM_MODEL
 
@@ -284,6 +321,45 @@ class DoubaoProvider(LLMProvider):
         valid_ids = {c["id"] for c in candidates}
         return [i for i in ids if i in valid_ids][:top_k]
 
+    async def polish(self, query: str, answer: str) -> str:
+        """对知识库标准答案做受限润色
+
+        约束: 只能调整语气/格式/排版, 严禁修改或删减原文的
+        步骤、参数、数值、条件、转人工提示等任何实质内容。
+        """
+        if not answer or not answer.strip():
+            return answer
+
+        system_prompt = (
+            "你是客服回复润色助手。把知识库的标准答案润色成更友好、易读的客服回复。\n"
+            "【严格约束 - 必须遵守】\n"
+            "1. 严禁修改、删减、增加任何步骤、操作、参数、数值、条件\n"
+            "2. 严禁改动原文的转人工提示、注意事项\n"
+            "3. 原文里的菜单路径(如 菜单--设备信息)、按键操作、规格参数必须原样保留\n"
+            "4. 不得凭空补充原文没有的信息\n"
+            "【允许的润色】\n"
+            "- 调整语气更友好(如开头加'您可以这样操作:')\n"
+            "- 用项目符号/编号让步骤更清晰\n"
+            "- 适当分段\n"
+            "- 修正明显的标点/错别字\n"
+            "只返回润色后的回复, 不要任何解释。"
+        )
+        user_content = f"用户问题: {query}\n\n知识库标准答案:\n{answer}\n\n润色后的回复:"
+
+        try:
+            response = await self.chat([
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ])
+            # 安全兜底: 若润色结果明显比原文短很多, 可能丢了内容, 回退原文
+            if response and len(response.strip()) < len(answer.strip()) * 0.5:
+                logger.warning("润色结果过短, 疑似丢内容, 回退原文")
+                return answer
+            return response.strip() or answer
+        except Exception as e:
+            logger.warning(f"润色失败, 返回原文: {e}")
+            return answer
+
 
 class MockProvider(LLMProvider):
     """Mock 提供者 (开发/测试用, 不依赖外部LLM)"""
@@ -322,6 +398,10 @@ class MockProvider(LLMProvider):
             scored.append((c["id"], overlap))
         scored.sort(key=lambda x: x[1], reverse=True)
         return [i for i, _ in scored[:top_k] if _ > 0]
+
+    async def polish(self, query: str, answer: str) -> str:
+        """Mock润色: 不调大模型, 原样返回 (开发兜底)"""
+        return answer
 
 
 # ============================================
