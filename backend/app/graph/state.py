@@ -99,7 +99,7 @@ class WorkflowState(TypedDict, total=False):
     should_transfer: bool               # 是否需要转人工
     transfer_reason_type: Optional[str] # 转人工原因类型
     transfer_reason: Optional[str]      # 转人工原因
-    transfer_summary: Optional[str]     # AI对话摘要(给人工客服)
+    transfer_summary: Optional[str]     # 完整对话上下文(给人工客服, 不做摘要)
     transfer_ticket_id: Optional[str]   # 工单ID
     transfer_priority: Optional[str]    # 工单优先级
     evaluation_prompt: Optional[str]    # 评价引导语

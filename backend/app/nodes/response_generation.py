@@ -100,15 +100,17 @@ async def _build_knowledge_with_db(state: WorkflowState, db):
     if matched_ids and matched_scores and max(matched_scores) >= 0.4:
         # 获取最佳匹配的知识
         best_id = matched_ids[0]
-        knowledge = await knowledge_service.get_knowledge_by_id(db, best_id)
+        business_area = state.get("business_area", "dashcam")
+        knowledge = await knowledge_service.get_knowledge_by_id(db, best_id, business_area)
 
         if knowledge:
             state["response_type"] = "knowledge_answer"
-            state["final_response"] = knowledge.standard_answer
+            # 优先用润色答案
+            state["final_response"] = getattr(knowledge, "polished_answer", None) or knowledge.standard_answer
 
-            # 附件
+            # 附件 (仅dashcam有)
             attachments = []
-            if knowledge.need_attachment:
+            if getattr(knowledge, "need_attachment", False) and hasattr(knowledge, "attachments"):
                 for att in knowledge.attachments:
                     attachments.append({
                         "type": att.file_type or "link",

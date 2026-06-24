@@ -68,7 +68,7 @@ class OperationalDevice(Base):
     device_model = Column(String(64), comment="设备型号")
     online_status = Column(String(16), comment="在线状态")
     gps_status = Column(String(16), comment="定位状态")
-    service_provider = Column(String(64), comment="服务商")
+    service_provider = Column(String(128), comment="服务商")
     service_expiry = Column(DateTime(timezone=True), comment="服务到期日")
     firmware_version = Column(String(32), comment="固件版本")
     mcu_version = Column(String(32), comment="MCU版本")
@@ -89,4 +89,56 @@ class DeviceVehicleRelation(Base):
     relation_type = Column(String(32), default="current", comment="current/history")
     effective_time = Column(DateTime(timezone=True), comment="生效时间")
     expire_time = Column(DateTime(timezone=True), comment="失效时间")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class YouweiDevice(Base):
+    """有为设备明细表 (10010台, 用于区分极目/有为品牌)
+
+    品牌识别逻辑: 运营平台接口返回"鱼快"时, 拿终端ID号查此表
+    - 查到 → 有为
+    - 查不到 → 极目
+    关联键: terminal_id (终端ID号), 对应接口的 recorderId
+    """
+    __tablename__ = "youwei_device"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    terminal_id = Column(String(32), unique=True, index=True, nullable=False, comment="终端ID号 (关联键)")
+    sim_no_11 = Column(String(32), comment="SIM卡号(11位)")
+    iccid = Column(String(32), index=True, comment="ICCID号")
+    imei = Column(String(32), comment="IMEI")
+    product_model = Column(String(64), comment="产品型号")
+    produce_date = Column(DateTime(timezone=True), comment="生产日期")
+    imsi = Column(String(32), comment="IMSI")
+    raw_data = Column("metadata", JSON, comment="原始明细全字段(扩展用)")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class OperationalData(Base):
+    """运营平台数据表 (离线验证用, 接口就绪后可移除/改回接口查询)
+
+    主键: VIN号。用于验证 VIN→品牌/终端号/在线状态 等查询。
+    字段对齐运营平台数据Excel的18列。
+    """
+    __tablename__ = "operational_data"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    vin = Column(String(32), index=True, nullable=False, comment="VIN号 (查询主键, 多sheet可能有重复)")
+    plate_number = Column(String(16), index=True, comment="车牌号")
+    recorder_id = Column(String(32), index=True, comment="行车记录仪ID")
+    terminal_id = Column(String(32), index=True, comment="设备终端号")
+    device_brand = Column(String(32), index=True, comment="行车记录仪品牌 (鱼快/航天/启明/锐明)")
+    aak_status = Column(String(16), comment="aak状态")
+    aak_time = Column(DateTime(timezone=True), comment="aak时间")
+    service_provider = Column(String(128), comment="所属服务商")
+    organization = Column(String(256), comment="所属机构")
+    register_time = Column(DateTime(timezone=True), comment="落籍时间")
+    net_in_time = Column(DateTime(timezone=True), comment="入网时间")
+    package_name = Column(String(128), comment="套餐名称")
+    traffic_expire = Column(DateTime(timezone=True), comment="流量到期时间")
+    freight_validity = Column(String(128), comment="货运平台有效期")
+    order_status = Column(String(32), comment="订单状态")
+    activate_status = Column(String(32), comment="终端开通状态")
+    online_status = Column(String(32), index=True, comment="终端在线状态")
+    business_type = Column(String(32), comment="业务类型")
     created_at = Column(DateTime(timezone=True), server_default=func.now())

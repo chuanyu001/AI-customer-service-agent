@@ -37,32 +37,17 @@ async def knowledge_retrieval_node(state: WorkflowState) -> WorkflowState:
             state["collected_slots"]["brand"] = brand_name
 
     # ============================================
-    # Step 2: 三层检索
+    # Step 2: 三层检索 (品牌逻辑已在chat.py处理)
     # ============================================
     matched_ids, matched_scores, method = await knowledge_service.retrieve(
         db=None,  # 由调用方注入, 这里从state获取
         query=query,
-        brand_id=brand_id,
         business_area=business_area,
         top_k=5,
     )
 
     # ============================================
-    # Step 3: 品牌降级
-    # ============================================
-    if not matched_ids and brand_id is not None:
-        # 该品牌无匹配 → 降级到通用知识
-        matched_ids, matched_scores, method = await knowledge_service.retrieve(
-            db=None,
-            query=query,
-            brand_id=None,  # 不限制品牌
-            business_area=business_area,
-            top_k=5,
-        )
-        method = f"{method}_brand_fallback"
-
-    # ============================================
-    # Step 4: 更新状态
+    # Step 3: 更新状态
     # ============================================
     state["matched_knowledge_ids"] = matched_ids
     state["matched_knowledge_scores"] = matched_scores
@@ -91,25 +76,13 @@ async def knowledge_retrieval_with_db(state: WorkflowState, db) -> WorkflowState
             brand_name = keyword_result.brand_name
             state["collected_slots"]["brand"] = brand_name
 
-    # 三层检索
+    # 三层检索 (品牌逻辑已在chat.py处理, 此处仅按business_area检索)
     matched_ids, matched_scores, method = await knowledge_service.retrieve(
         db=db,
         query=query,
-        brand_id=brand_id,
         business_area=business_area,
         top_k=5,
     )
-
-    # 品牌降级
-    if not matched_ids and brand_id is not None:
-        matched_ids, matched_scores, method = await knowledge_service.retrieve(
-            db=db,
-            query=query,
-            brand_id=None,
-            business_area=business_area,
-            top_k=5,
-        )
-        method = f"{method}_brand_fallback"
 
     state["matched_knowledge_ids"] = matched_ids
     state["matched_knowledge_scores"] = matched_scores

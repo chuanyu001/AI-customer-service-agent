@@ -7,7 +7,7 @@ from sqlalchemy import select, and_, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.models import Conversation, Message, AnswerFeedback
+from app.models import Conversation, Message, AnswerFeedback, HandoffTicket
 from app.core.redis_client import get_session_state, set_session_state
 from app.core.config import settings
 
@@ -128,6 +128,54 @@ class SessionService:
             if status in ("resolved", "closed"):
                 conv.ended_at = datetime.now()
             await db.flush()
+
+    @staticmethod
+    async def create_handoff_ticket(
+        db: AsyncSession,
+        session_id: str,
+        reason_type: str,
+        reason_detail: str = "",
+        collected_info: Optional[Dict[str, Any]] = None,
+        priority: str = "normal",
+    ) -> Optional[HandoffTicket]:
+        """创建转人工工单
+
+        summary 字段存完整对话上下文(该会话全部消息, 不做LLM摘要),
+        供人工客服直接查看。collected_info 存已收集的业务信息(VIN/品牌等)。
+        """
+        conv = await SessionService.get_session(db, session_id)
+        if not conv:
+            return None
+
+        # 拉取该会话全部消息, 拼成完整对话上下文
+        stmt = (
+            select(Message)
+            .where(Message.conversation_id == conv.id)
+            .order_by(Message.seq.asc())
+        )
+        result = await db.execute(stmt)
+        messages = result.scalars().all()
+
+        context_lines = []
+        role_label = {"user": "用户", "assistant": "客服", "system": "系统"}
+        for m in messages:
+            label = role_label.get(m.role, m.role)
+            context_lines.append(f"【{label}】{m.content or ''}")
+        full_context = "\n".join(context_lines) if context_lines else "（无对话记录）"
+
+        ticket = HandoffTicket(
+            ticket_id=str(uuid.uuid4()),
+            conversation_id=conv.id,
+            reason_type=reason_type,
+            reason_detail=reason_detail,
+            summary=full_context,
+            collected_info=collected_info or {},
+            priority=priority,
+            status="pending",
+        )
+        db.add(ticket)
+        await db.flush()
+        return ticket
 
     @staticmethod
     async def update_consecutive_fail(
