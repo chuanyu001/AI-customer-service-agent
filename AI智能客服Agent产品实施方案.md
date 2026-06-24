@@ -1,7 +1,7 @@
 # AI智能客服Agent — 产品实施方案（进度更新版）
 
 > 更新日期：2026-06-24
-> 状态：**四业务知识库全量导入 + 是否对客转人工机制上线**，行车记录仪全链路可用，接火山方舟大模型
+> 状态：**品牌识别双因子(VIN+终端号) + VIN主动识别 + 四业务知识库全量更新**，行车记录仪全链路可用
 
 ---
 
@@ -12,7 +12,7 @@
 **核心约束**：
 - 本地 MySQL + 火山方舟大模型（豆包），H5 页面不直连大模型和数据库
 - 运营平台数据通过接口实时查询（batchVehicleInfo），不落库、不直接给大模型
-- 四业务知识库已全部导入数据库（dashcam 144 / wifi 9 / data 20 / refueling 8）
+- 四业务知识库已全部导入数据库（dashcam 144 / wifi 9 / data 11 / refueling 8 / youwei_device 10010）
 - 每条知识标记「是否对客」（对客/转人工），转人工类知识命中后先追问收集信息再转人工，转人工工单携带完整对话上下文给坐席
 
 **当前实际进度**：四业务知识库全量导入 + 「是否对客」转人工机制（转人工前追问 + 工单带完整上下文）已上线；行车记录仪业务的「意图识别→知识检索→品牌追问→回复生成→转人工」全链路已跑通，前端 H5 页面可对话，大模型已接入火山方舟豆包。
@@ -41,6 +41,10 @@
 | 前端H5页面 | ✅ | 聊天界面，FAQ卡片/对话/追问/评价/转人工/图片上传 |
 | 知识库合并 | ✅ | 4业务知识库合并成1个Excel（8个Sheet，列名统一） |
 | 四业务润色版6.24 | ✅ | 列结构统一13列+是否对客+答复策略(追问语)，记录仪同款样式 |
+| 品牌识别双因子 | ✅ | VIN+终端号(行车记录仪ID)联合识别，终端号规则优先，VIN交叉验证（见§2.8） |
+| VIN主动品牌识别 | ✅ | 用户直接发纯VIN时，dashcam业务主动查品牌返回，不依赖pending上下文（见§2.8） |
+| 有为设备全量导入 | ✅ | youwei_device表导入10010台明细，终端号→品牌查表即得 |
+| 多业务知识库全量更新 | ✅ | WiFi 9/Data 11/Refueling 8，全量替换导入，对齐6.24确认版Excel |
 
 ### 待完成 ⏳
 
@@ -77,25 +81,28 @@
   │    ├─ 转人工/高风险词/超出范围 → 转人工
   │    └─ 问候语 → 欢迎语+FAQ卡片
   │
-  ├─ ③ 意图分类（豆包大模型）
+  ├─ ③ VIN主动品牌识别 (NEW: dashcam业务, 纯VIN消息)
+  │    └─ 主动查VIN+终端号双因子→识别到品牌→返回+存pending
+  │
+  ├─ ④ 意图分类（豆包大模型）
   │    └─ knowledge_query / live_query / unknown
   │
-  ├─ ④ 知识检索（knowledge_query）
+  ├─ ⑤ 知识检索（knowledge_query）
   │    ├─ L1 精确匹配（SQL，高分快速通道）
   │    ├─ L3 大模型全量检索（主路径，含主题标签）
   │    └─ L2 关键词兜底
   │
-  ├─ ⑤ 品牌感知
+  ├─ ⑥ 品牌感知
   │    ├─ 命中need_brand=1 + 已指定品牌 → 返回该品牌知识
   │    ├─ 命中need_brand=1 + 未指定品牌 → 追问品牌（存pending）
   │    └─ need_brand=0 → 直接返回通用答案
   │
-  ├─ ⑤.5 是否对客判断
+  ├─ ⑦ 是否对客判断
   │    ├─ auto_reply=True（对客） → 直接返回知识答案
   │    └─ auto_reply=False（转人工）→ 用transfer_prompt追问收集信息（存pending=transfer_collection）
   │         └─ 下一轮用户回应 → 提取VIN/ICCID → 转人工，工单带完整上下文
   │
-  └─ ⑥ 查询意图（live_query）→ 提取VIN → 调运营平台接口查询 → 返回结果
+  └─ ⑧ 查询意图（live_query）→ 提取VIN → 调运营平台接口查询 → 返回结果
 ```
 
 ---
@@ -248,6 +255,59 @@
 - `query_intent_config.data_source`：13条从 `operational_db` → `platform_api`
 - `operational_device` / `device_vehicle_relation` 表保留空表（不再导入数据，留作未来缓存用途）
 
+### 8. 品牌识别双因子：VIN + 终端号联合识别
+
+**问题**：仅通过 VIN 查 `operational_data` 表的 `device_brand` 字段判断品牌可能出错（运营数据本身有误标）。需要用**行车记录仪ID（终端号）**做二次验证。
+
+**终端号品牌规则**（来自业务方确认，见「有为设备10010台明细.xlsx」的「通过ID判断设备品牌」Sheet）：
+
+| 序号 | 品牌 | 终端号规则 | 置信度 |
+|------|------|-----------|--------|
+| 1 | 有为 | 查 `youwei_device` 表（10010台全量），命中即确定 | 0.95 |
+| 2 | 雅迅 | 00开头纯数字 | 0.95 |
+| 3 | 启明 | 31开头纯数字 | 0.95 |
+| 4 | 极目 | 7位纯数字(95%) / 第1或2位是A其余数字(5%) | 0.95/0.90 |
+| 5 | 航天 | 数字字母混合(95%) / 90或91开头纯数字 | 0.85/0.80 |
+
+**实现**（`brand_service.py`）：
+
+```
+identify_by_vin(VIN)
+  ↓
+查 operational_data → device_brand + recorder_id(行车记录仪ID)
+  ↓
+① 先用 recorder_id 跑 identify_by_terminal_id (终端号规则，更可靠)
+  ├── 命中 + VIN结果一致 → 置信度 +0.05，path="vin_terminal_combined"
+  ├── 命中 + VIN不一致 → 终端号优先，标记差异（"VIN结果与终端号不一致，以终端号为准"）
+  └── 未命中 → 回退VIN查表
+       ├── device_brand="鱼快" → youwei表二级区分极目/有为
+       └── 其他 → _map_vin_brand 直接映射 (置信度 0.90，标记"无终端号验证")
+```
+
+**关键设计**：终端号规则优先于 VIN 查表，因为 VIN 可能出错但终端号规则是业务方确认的确定规则。
+
+### 9. VIN主动品牌识别（无pending上下文）
+
+**问题**：用户直接发纯 VIN（如 "LFNAHUPMXT1E19383"）时，没有 pending 上下文，意图分类可能误判为 unknown，知识检索也匹配不到，最终走到兜底回复。
+
+**解决**（`chat.py` Step 3.5）：在意图识别之前，增加 VIN 主动品牌识别：
+
+```
+用户消息
+  ↓
+Step 3.5 (NEW): dashcam业务 + 无pending + 纯VIN消息
+  ├── 调用 identify_by_vin (含终端号双因子)
+  ├── 识别到品牌 → 返回"已通过VIN识别到您的设备品牌为「XX」"，存pending供后续复用
+  └── 未识别 → 静默降级，继续走 Step 4 意图识别
+```
+
+**触发条件**（全部满足）：
+- `business_area == "dashcam"`
+- 无 pending 上下文
+- 消息是**纯 VIN**（`stripped == vin`，避免误拦截"查设备 LFNAHUPMXT1E19383"这类完整查询）
+
+**特点**：不依赖 pending 上下文，即使会话变了也能工作。
+
 ---
 
 ## 四、数据库设计（21张表，已建好）
@@ -255,7 +315,7 @@
 | 表组 | 表 | 状态 |
 |---|---|---|
 | **知识数据** | knowledge_answer(144) / question_variant(415) / keyword(914) / attachment / version / faq_card(10) / query_intent_config(13) | ✅已导入 |
-| **业务事实** | brand_info(7) / brand_mapping / field_dictionary(22) / operational_device(保留空表,改用接口) / device_vehicle_relation | ✅接口查询已通 |
+| **业务事实** | brand_info(7) / brand_mapping / field_dictionary(22) / youwei_device(10010) / operational_device(保留空表) / device_vehicle_relation | ✅品牌识别双因子 |
 | **运行数据** | conversation(93测试会话) / message(155) / answer_feedback / handoff_ticket / optimization_sample | ✅ |
 | **系统配置** | system_config(14) / data_dictionary(26) / event_log | ✅ |
 
@@ -284,14 +344,13 @@
 
 ## 七、知识库合并（已完成）
 
-四业务知识库已合并成1个Excel（8个Sheet，列名统一）：
-- `知识库汇总版6.22.xlsx`
-- 4业务知识问答各1个Sheet（列名统一为13列标准）
-- 记录仪查询问题库/品牌识别规则/运营字段字典3个专有Sheet
-- 1个使用说明汇总Sheet
-- 已套用统一样式（深蓝表头/冻结首行/自动筛选）
+四业务知识库以各业务独立 Excel 形式维护（6.24确认版）：
+- `WiFi套餐知识库确认版6.24.xlsx`（9条）
+- `基础流量处理知识库确认版6.24.xlsx`（11条）
+- `折扣加油知识库确认版6.24.xlsx`（8条）
+- `有为设备10010台明细.xlsx`（10010台，含终端号品牌识别规则Sheet）
 
-合并脚本：`scripts/merge_knowledge_base.py` + `scripts/style_knowledge_base.py`
+导入脚本：`scripts/import_multi_business.py`（全量替换策略，一键更新四业务+有为设备）
 
 ---
 
@@ -299,31 +358,21 @@
 
 ### 优先级 P0（下一步要做）
 
-1. **导入WiFi/流量/加油知识库**
-   - 复用现有导入脚本，按business_area区分
-   - 三业务都是纯知识问答（无品牌追问、无数据库查询），接入很快
-
-2. **多业务路由**
+1. **多业务路由端到端验证**
    - 按小程序入口business_area路由到对应业务知识
    - 前端加业务切换或由入口参数自动路由
+   - WiFi/Data/Refueling 三业务的知识库已全量导入，可直接测
 
-### 优先级 P1
-
-3. ~~**运营平台数据查询**~~ ✅ 已完成
-   - 改用 batchVehicleInfo 接口实时查询（不落库），已跑通
-   - live_query 分支：用户问"我的终端号是多少"→追问VIN→调接口→返回
-   - VIN 多轮上下文衔接已实现
-
-4. **响应慢优化**（当前单次10-15秒）
+2. **响应慢优化**（当前单次7-13秒）
    - 方案A：意图分类改回关键词规则（省1次大模型调用）
    - 方案B：改用向量检索（需开通火山方舟embedding模型）
    - 详见 `TODO-响应慢优化.md`
 
-### 优先级 P2
+### 优先级 P1
 
-5. 七鱼工单对接
-6. 数据看板完善（漏斗/趋势/知识统计）
-7. 人机协同训练（优化样本池）
+3. 七鱼工单对接
+4. 数据看板完善（漏斗/趋势/知识统计）
+5. 人机协同训练（优化样本池）
 
 ---
 
@@ -361,7 +410,7 @@ AI customer service agent/
 │   ├── services/            # LLM/知识检索/品牌识别/会话
 │   └── integrations/        # 七鱼/运营平台对接
 ├── frontend/h5-chat/        # H5聊天页面
-├── scripts/                 # 建表/导入/种子/合并/样式脚本
+├── scripts/                 # 建表/导入/种子/多业务导入(import_multi_business)
 ├── AI智能客服Agent产品实施方案.md  # 本文档
 ├── TODO-响应慢优化.md        # 性能待办
 └── .env                     # 火山方舟配置

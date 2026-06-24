@@ -491,6 +491,55 @@ async def send_message(
         )
 
     # ============================================
+    # Step 3.5: VIN主动品牌识别 (dashcam业务, 无pending上下文)
+    # ============================================
+    # 用户直接发VIN (如 LFNAHUPMXT1E19383) 时, 不依赖pending上下文,
+    # 主动通过VIN查询品牌, 即使会话变了也能工作
+    # 仅拦截"纯VIN"消息, 避免误拦截含VIN的完整查询 (如"查设备 LFNAHUPMXT1E19383"应走live_query)
+    if req.business_area == "dashcam" and not pending:
+        vin = _extract_vin(req.content)
+        if vin:
+            stripped = req.content.strip().upper()
+            is_pure_vin = (stripped == vin)
+            if is_pure_vin:
+                try:
+                    brand_result = await brand_service.identify_by_vin(db, vin)
+                except Exception as e:
+                    logger.warning(f"[VIN主动识别] VIN={vin} 品牌查询异常: {e}")
+                    brand_result = None
+                if brand_result and brand_result.brand_name:
+                    ai_msg = await session_service.add_message(
+                        db=db,
+                        conversation_id=conv.id,
+                        role="assistant",
+                        content=f"已通过车架号(VIN)识别到您的设备品牌为「{brand_result.brand_name}」。请问您遇到了什么问题，我来帮您解答。",
+                        action="auto_reply",
+                        reply_type="brand_identified",
+                        intent_result={"intent": "knowledge_query", "brand": brand_result.brand_name, "vin": vin, "via": "vin_proactive"},
+                    )
+                    # 记录品牌识别结果到pending, 方便后续追问时复用
+                    await session_service.set_pending_context(db, session_id, {
+                        "type": "brand_identified",
+                        "brand_name": brand_result.brand_name,
+                        "vin": vin,
+                    })
+                    await session_service.update_consecutive_fail(db, session_id, increment=False)
+                    await db.commit()
+                    return BaseResponse(
+                        data=ChatMessageResponse(
+                            session_id=session_id,
+                            message_id=ai_msg.message_id,
+                            seq=ai_msg.seq,
+                            content=ai_msg.content,
+                            response_type="brand_identified",
+                            follow_up_questions=["设备离线了怎么办?", "如何查询SIM卡号?", "如何查看设备绑定状态?"],
+                            evaluation_prompt="这个回答有帮助吗?",
+                        ).model_dump()
+                    )
+                else:
+                    logger.info(f"[VIN主动识别] VIN={vin} 未匹配到品牌, 走正常流程")
+
+    # ============================================
     # Step 4: 运行简化版工作流 (不使用LangGraph runtime, 直接调用)
     # ============================================
     llm = get_llm()

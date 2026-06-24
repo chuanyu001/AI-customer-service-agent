@@ -6,7 +6,7 @@ from typing import Dict, Optional, List
 from dataclasses import dataclass, field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.models import BrandInfo, BrandMapping, OperationalDevice
+from app.models import BrandInfo, BrandMapping, OperationalDevice, YouweiDevice, OperationalData
 
 
 @dataclass
@@ -101,26 +101,21 @@ class BrandIdentificationService:
     async def identify_by_vin(
         self, db: AsyncSession, vin: str
     ) -> Optional[BrandResult]:
-        """两级品牌识别: 通过VIN查运营平台数据 + 有为明细表
+        """VIN+终端号 双因子联合品牌识别
 
-        离线验证: 优先查 operational_data 表 (含device_brand字段)
-        接口就绪后: 改查 platform_client.get_device_brand
-
-        逻辑:
-        1. 查运营数据 → 拿到 brand(品牌字段) + terminal_id(终端号)
-        2. brand="鱼快" → 拿terminal_id查youwei_device表区分极目/有为
-           (注: youwei表终端号格式与运营数据不一致, 暂时鱼快先归极目, 待关联确认)
-        3. brand=航天/雅迅/启明等 → 直接用
+        VIN查品牌有可能出错, 终端号规则更可靠 → 二者结合:
+        1. 查 operational_data → 拿到 device_brand + recorder_id(行车记录仪ID)
+        2. 用 recorder_id 跑终端号规则 (优先, 更可靠)
+        3. 终端号命中 → 返回 (若与VIN结果一致则提升置信度)
+        4. 终端号未命中 → 回退VIN查表逻辑
+        5. 离线表查不到 → 调接口
 
         Returns:
             BrandResult 或 None(查询失败/VIN不存在)
         """
-        # 优先查离线 operational_data 表 (验证用)
-        from app.models import OperationalData
-        from sqlalchemy import select as sa_select
 
         result = await db.execute(
-            sa_select(OperationalData).where(OperationalData.vin == vin).limit(1)
+            select(OperationalData).where(OperationalData.vin == vin).limit(1)
         )
         op_data = result.scalar_one_or_none()
 
@@ -133,41 +128,147 @@ class BrandIdentificationService:
                 info = None
             if not info:
                 return None
-            brand = info.get("brand")
-            terminal_id = info.get("terminal_id")
+            vin_brand = info.get("brand")
+            # 接口返回的终端号: recorder_id 或 terminal_id
+            tid = info.get("recorder_id") or info.get("terminal_id")
         else:
-            brand = op_data.device_brand
-            terminal_id = op_data.terminal_id
+            vin_brand = op_data.device_brand
+            # 行车记录仪ID (recorder_id) 优先, 设备终端号做fallback
+            tid = op_data.recorder_id or op_data.terminal_id
 
-        if not brand:
+        # ============================================
+        # 终端号规则识别 (优先, 比VIN查品牌更可靠)
+        # ============================================
+        tid_result = await self.identify_by_terminal_id(db, tid)
+
+        if tid_result:
+            # 终端号命中 → 若VIN结果一致则提升置信度
+            if vin_brand:
+                vin_mapped = self._map_vin_brand(vin_brand)
+                if vin_mapped and vin_mapped == tid_result.brand_name:
+                    tid_result.confidence = min(tid_result.confidence + 0.05, 1.0)
+                    tid_result.path = f"vin_terminal_combined({tid_result.path})"
+                    tid_result.matched_rule += f"; VIN结果一致({vin_brand})→置信度提升"
+                elif vin_mapped:
+                    # VIN与终端号不一致 → 终端号优先, 标记差异
+                    tid_result.matched_rule += f"; VIN结果={vin_brand}(与终端号不一致,以终端号为准)"
+            return tid_result
+
+        # ============================================
+        # 终端号未命中 → 回退VIN查表
+        # ============================================
+        if not vin_brand:
             return None
 
-        # 鱼快 → 二级区分极目/有为 (youwei关联待确认, 暂时鱼快归极目)
-        if brand == "鱼快":
-            if terminal_id:
-                from app.models import YouweiDevice
+        # 鱼快 → 二级区分极目/有为
+        if vin_brand == "鱼快":
+            tid_for_yw = op_data.terminal_id if op_data else tid
+            if tid_for_yw:
                 yw = (await db.execute(
-                    sa_select(YouweiDevice).where(YouweiDevice.terminal_id == str(terminal_id))
+                    select(YouweiDevice).where(YouweiDevice.terminal_id == str(tid_for_yw))
                 )).scalar_one_or_none()
                 if yw:
                     return BrandResult(brand_name="有为", confidence=0.9,
                                        path="youwei_lookup",
-                                       matched_rule=f"终端号{terminal_id}在有为明细表中 → 有为")
+                                       matched_rule=f"终端号{tid_for_yw}在有为明细表中 → 有为")
             # youwei关联不上, 鱼快暂归极目
             return BrandResult(brand_name="极目(GPS+BD)", confidence=0.7,
                                path="operational_data_yukuai",
-                               matched_rule=f"运营数据品牌=鱼快, youwei未匹配 → 极目(待确认)")
+                               matched_rule="运营数据品牌=鱼快, youwei未匹配 → 极目(待确认)")
 
         # 其他品牌直接用
+        mapped = self._map_vin_brand(vin_brand)
+        if mapped:
+            return BrandResult(brand_name=mapped, confidence=0.90,
+                               path="operational_data_vin_only",
+                               matched_rule=f"运营数据品牌: {vin_brand}(无终端号验证)")
+        return None
+
+    @staticmethod
+    def _map_vin_brand(brand: str) -> Optional[str]:
+        """运营数据 device_brand → 标准品牌名映射"""
         brand_map = {
             "航天": "航天", "雅迅": "雅迅", "启明": "启明", "锐明": "锐明",
-            "极目": "极目(GPS+BD)", "有为": "有为",
+            "极目": "极目(GPS+BD)", "有为": "有为", "鱼快": "极目(GPS+BD)",
         }
-        mapped = brand_map.get(brand)
-        if mapped:
-            return BrandResult(brand_name=mapped, confidence=0.95,
-                               path="operational_data",
-                               matched_rule=f"运营数据品牌: {brand}")
+        return brand_map.get(brand)
+
+    async def identify_by_terminal_id(
+        self, db: AsyncSession, terminal_id: Optional[str]
+    ) -> Optional[BrandResult]:
+        """通过行车记录仪ID识别品牌 (5品牌规则, 不依赖VIN)
+
+        规则优先级 (高→低):
+        1. 有为: 查youwei_device明细表 (全量10010台, 最确定)
+        2. 雅迅: 00开头纯数字
+        3. 启明: 31开头纯数字
+        4. 极目: 7位纯数字(95%) / 第1或2位是A其余数字(5%)
+        5. 航天: 数字字母混合(95%) / 90或91开头纯数字
+
+        Args:
+            db: 数据库会话
+            terminal_id: 行车记录仪ID (recorder_id 或 terminal_id)
+
+        Returns:
+            BrandResult 或 None(规则未命中)
+        """
+        if not terminal_id:
+            return None
+
+        tid = str(terminal_id).strip().upper()
+        if not tid:
+            return None
+
+        # 1. 有为: DB查明细表 (最确定)
+        yw = (await db.execute(
+            select(YouweiDevice).where(YouweiDevice.terminal_id == tid).limit(1)
+        )).scalar_one_or_none()
+        if yw:
+            return BrandResult(brand_name="有为", confidence=0.95,
+                               path="terminal_id_yw_table",
+                               matched_rule=f"终端号{tid}在有为明细表中 → 有为")
+
+        # 2. 雅迅: 00开头纯数字
+        if tid.isdigit() and tid.startswith("00"):
+            return BrandResult(brand_name="雅迅", confidence=0.95,
+                               path="terminal_id_rule",
+                               matched_rule=f"终端号{tid}: 00开头纯数字 → 雅迅")
+
+        # 3. 启明: 31开头纯数字
+        if tid.isdigit() and tid.startswith("31"):
+            return BrandResult(brand_name="启明", confidence=0.95,
+                               path="terminal_id_rule",
+                               matched_rule=f"终端号{tid}: 31开头纯数字 → 启明")
+
+        # 4. 极目: 7位, 95%纯数字 / 5%第1或2位A其余数字
+        if len(tid) == 7:
+            if tid.isdigit():
+                return BrandResult(brand_name="极目(GPS+BD)", confidence=0.95,
+                                   path="terminal_id_rule",
+                                   matched_rule=f"终端号{tid}: 7位纯数字 → 极目")
+            # 第1位A, 其余数字
+            if tid[0] == "A" and tid[1:].isdigit():
+                return BrandResult(brand_name="极目(GPS+BD)", confidence=0.90,
+                                   path="terminal_id_rule",
+                                   matched_rule=f"终端号{tid}: 第1位A其余数字 → 极目")
+            # 第2位A, 其余数字 (如 1A34567)
+            if len(tid) >= 2 and tid[1] == "A" and tid[0].isdigit() and tid[2:].isdigit():
+                return BrandResult(brand_name="极目(GPS+BD)", confidence=0.90,
+                                   path="terminal_id_rule",
+                                   matched_rule=f"终端号{tid}: 第2位A其余数字 → 极目")
+
+        # 5. 航天: 95%数字字母混合 / 极少90或91开头纯数字
+        has_digit = any(c.isdigit() for c in tid)
+        has_alpha = any(c.isalpha() for c in tid)
+        if has_digit and has_alpha:
+            return BrandResult(brand_name="航天", confidence=0.85,
+                               path="terminal_id_rule",
+                               matched_rule=f"终端号{tid}: 数字字母混合 → 航天")
+        if tid.isdigit() and (tid.startswith("90") or tid.startswith("91")):
+            return BrandResult(brand_name="航天", confidence=0.80,
+                               path="terminal_id_rule",
+                               matched_rule=f"终端号{tid}: 90/91开头纯数字 → 航天")
+
         return None
 
     async def _exact_table_lookup(
