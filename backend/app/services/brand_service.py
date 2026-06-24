@@ -98,6 +98,78 @@ class BrandIdentificationService:
                 )
         return None
 
+    async def identify_by_vin(
+        self, db: AsyncSession, vin: str
+    ) -> Optional[BrandResult]:
+        """两级品牌识别: 通过VIN查运营平台数据 + 有为明细表
+
+        离线验证: 优先查 operational_data 表 (含device_brand字段)
+        接口就绪后: 改查 platform_client.get_device_brand
+
+        逻辑:
+        1. 查运营数据 → 拿到 brand(品牌字段) + terminal_id(终端号)
+        2. brand="鱼快" → 拿terminal_id查youwei_device表区分极目/有为
+           (注: youwei表终端号格式与运营数据不一致, 暂时鱼快先归极目, 待关联确认)
+        3. brand=航天/雅迅/启明等 → 直接用
+
+        Returns:
+            BrandResult 或 None(查询失败/VIN不存在)
+        """
+        # 优先查离线 operational_data 表 (验证用)
+        from app.models import OperationalData
+        from sqlalchemy import select as sa_select
+
+        result = await db.execute(
+            sa_select(OperationalData).where(OperationalData.vin == vin).limit(1)
+        )
+        op_data = result.scalar_one_or_none()
+
+        if not op_data:
+            # 离线表查不到, 尝试调接口 (接口就绪后生效)
+            from app.integrations.platform_client import platform_client
+            try:
+                info = await platform_client.get_device_brand(vin)
+            except Exception:
+                info = None
+            if not info:
+                return None
+            brand = info.get("brand")
+            terminal_id = info.get("terminal_id")
+        else:
+            brand = op_data.device_brand
+            terminal_id = op_data.terminal_id
+
+        if not brand:
+            return None
+
+        # 鱼快 → 二级区分极目/有为 (youwei关联待确认, 暂时鱼快归极目)
+        if brand == "鱼快":
+            if terminal_id:
+                from app.models import YouweiDevice
+                yw = (await db.execute(
+                    sa_select(YouweiDevice).where(YouweiDevice.terminal_id == str(terminal_id))
+                )).scalar_one_or_none()
+                if yw:
+                    return BrandResult(brand_name="有为", confidence=0.9,
+                                       path="youwei_lookup",
+                                       matched_rule=f"终端号{terminal_id}在有为明细表中 → 有为")
+            # youwei关联不上, 鱼快暂归极目
+            return BrandResult(brand_name="极目(GPS+BD)", confidence=0.7,
+                               path="operational_data_yukuai",
+                               matched_rule=f"运营数据品牌=鱼快, youwei未匹配 → 极目(待确认)")
+
+        # 其他品牌直接用
+        brand_map = {
+            "航天": "航天", "雅迅": "雅迅", "启明": "启明", "锐明": "锐明",
+            "极目": "极目(GPS+BD)", "有为": "有为",
+        }
+        mapped = brand_map.get(brand)
+        if mapped:
+            return BrandResult(brand_name=mapped, confidence=0.95,
+                               path="operational_data",
+                               matched_rule=f"运营数据品牌: {brand}")
+        return None
+
     async def _exact_table_lookup(
         self, db: AsyncSession, user_input: str, collected_info: Dict
     ) -> BrandResult:

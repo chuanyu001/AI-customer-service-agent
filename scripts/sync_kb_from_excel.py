@@ -122,8 +122,12 @@ async def sync_database():
             # 状态: 全部 published
             ka.status = "published"
 
-            # 答复策略 (原来源备注) → source_file字段复用
-            ka.source_file = clean(row.get("答复策略")) or None
+            # 是否对客 → auto_reply (对客=True/转人工=False)
+            customer_flag = clean(row.get("是否对客")) or "对客"
+            ka.auto_reply = (customer_flag == "对客")
+
+            # 答复策略(转人工前追问语) → transfer_prompt
+            ka.transfer_prompt = clean(row.get("答复策略")) or None
 
             updated += 1
 

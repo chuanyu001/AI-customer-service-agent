@@ -179,16 +179,16 @@ async def send_message(
     if pending and pending.get("type") == "brand_collection":
         brand_result = await brand_service.identify_by_keyword(req.content)
         if brand_result and brand_result.confidence >= 0.8:
-            # 识别到品牌 → 取该品牌、该主题的知识
+            # 识别到品牌 → 取该品牌、该主题的知识 (仅dashcam有品牌)
             brand_knowledge = await _get_brand_knowledge(
-                db, req.business_area,
+                db,
                 pending.get("category_l2", ""),
                 brand_result.brand_name,
             )
             if brand_knowledge:
                 await session_service.clear_pending_context(db, session_id)
                 attachments = []
-                if brand_knowledge.need_attachment:
+                if getattr(brand_knowledge, "need_attachment", False) and hasattr(brand_knowledge, "attachments"):
                     for att in brand_knowledge.attachments:
                         attachments.append({"type": att.file_type or "link", "url": att.file_url, "name": att.file_name})
                 reply_content = await _polish_answer(req.content, brand_knowledge)
@@ -218,8 +218,142 @@ async def send_message(
                         evaluation_prompt="这个回答有帮助吗?",
                     ).model_dump()
                 )
-        # 未识别出品牌 → 清除pending, 走正常流程 (用户可能改问别的)
+        # 未识别出品牌
+        # 检查用户是否说"不知道/不清楚" → 转VIN追问做两级识别
+        if _is_unknown_brand_response(req.content):
+            await session_service.clear_pending_context(db, session_id)
+            category_l2 = pending.get("category_l2", "")
+            await session_service.set_pending_context(db, session_id, {
+                "type": "vin_for_brand",
+                "category_l2": category_l2,
+            })
+            ai_msg = await session_service.add_message(
+                db=db, conversation_id=conv.id, role="assistant",
+                content="没关系, 请提供您的车架号(VIN), 我帮您查询设备品牌。",
+                action="ask_info", reply_type="vin_for_brand",
+                intent_result={"intent": "knowledge_query", "via": "brand_unknown"},
+            )
+            await db.commit()
+            return BaseResponse(data=ChatMessageResponse(
+                session_id=session_id, message_id=ai_msg.message_id, seq=ai_msg.seq,
+                content="没关系, 请提供您的车架号(VIN), 我帮您查询设备品牌。",
+                response_type="ask_slot", need_more_info=True,
+                ask_slot_prompt="请提供车架号(VIN)",
+            ).model_dump())
+        # 既没识别品牌也没说不知道 → 清除pending走正常流程
         await session_service.clear_pending_context(db, session_id)
+
+    # ============================================
+    # Step 2.6: VIN查品牌 (用户不知道品牌, 提供了VIN做两级识别)
+    # ============================================
+    if pending and pending.get("type") == "vin_for_brand":
+        vin = _extract_vin(req.content)
+        if vin:
+            await session_service.clear_pending_context(db, session_id)
+            category_l2 = pending.get("category_l2", "")
+            # 两级品牌识别
+            brand_result = await brand_service.identify_by_vin(db, vin)
+            if brand_result and brand_result.brand_name:
+                brand_knowledge = await _get_brand_knowledge(db, category_l2, brand_result.brand_name)
+                if brand_knowledge:
+                    reply_content = await _polish_answer(req.content, brand_knowledge)
+                    attachments = []
+                    if getattr(brand_knowledge, "need_attachment", False) and hasattr(brand_knowledge, "attachments"):
+                        for att in brand_knowledge.attachments:
+                            attachments.append({"type": att.file_type or "link", "url": att.file_url, "name": att.file_name})
+                    ai_msg = await session_service.add_message(
+                        db=db, conversation_id=conv.id, role="assistant",
+                        content=reply_content, action="auto_reply", reply_type="knowledge_answer",
+                        knowledge_id=brand_knowledge.id, knowledge_code=brand_knowledge.knowledge_code,
+                        intent_result={"intent": "knowledge_query", "brand": brand_result.brand_name, "via": "vin_brand_lookup"},
+                    )
+                    await session_service.update_consecutive_fail(db, session_id, increment=False)
+                    await db.commit()
+                    return BaseResponse(data=ChatMessageResponse(
+                        session_id=session_id, message_id=ai_msg.message_id, seq=ai_msg.seq,
+                        content=reply_content, response_type="knowledge_answer",
+                        knowledge_code=brand_knowledge.knowledge_code, attachments=attachments,
+                        follow_up_questions=_gen_follow_ups(brand_knowledge),
+                        evaluation_prompt="这个回答有帮助吗?",
+                    ).model_dump())
+            # 识别失败 → 提示转人工
+            ai_msg = await session_service.add_message(
+                db=db, conversation_id=conv.id, role="assistant",
+                content="抱歉, 未能通过VIN识别出您的设备品牌。建议您输入'转人工'联系客服协助。",
+                action="auto_reply", reply_type="fallback",
+                intent_result={"intent": "knowledge_query", "via": "vin_brand_lookup_failed"},
+            )
+            await db.commit()
+            return BaseResponse(data=ChatMessageResponse(
+                session_id=session_id, message_id=ai_msg.message_id, seq=ai_msg.seq,
+                content=ai_msg.content, response_type="fallback",
+                follow_up_questions=["转人工"],
+            ).model_dump())
+        # 没提取到VIN → 清除pending走正常流程
+        await session_service.clear_pending_context(db, session_id)
+
+    # ============================================
+    # Step 2.7: 多轮上下文 — 待处理的转人工追问
+    # ============================================
+    # 上一轮命中转人工类知识并追问, 本轮用户回应 → 提取关键信息后转人工
+    if pending and pending.get("type") == "transfer_collection":
+        await session_service.clear_pending_context(db, session_id)
+        # 尝试提取用户回应中的 VIN/ICCID 等关键信息
+        collected_vin = _extract_vin(req.content)
+        collected_info = []
+        if collected_vin:
+            collected_info.append(f"车架号(VIN)={collected_vin}")
+        info_str = "；".join(collected_info) if collected_info else "用户未提供VIN/ICCID"
+
+        await session_service.update_session_status(
+            db, session_id, "transferred",
+            transfer_count=(conv.transfer_count or 0) + 1,
+        )
+        # 创建转人工工单: summary 存完整对话上下文, collected_info 存已收集信息
+        await session_service.create_handoff_ticket(
+            db=db,
+            session_id=session_id,
+            reason_type="non_customer_kb",
+            reason_detail=f"命中需人工处理的知识: {pending.get('knowledge_code', '')}",
+            collected_info={"query": pending.get("query", ""), "collected": info_str},
+            priority="normal",
+        )
+        await db.commit()
+        transfer_msg = (
+            f"好的，已为您转接人工客服，请稍候...\n\n"
+            f"转接原因：该问题需人工客服处理（{pending.get('knowledge_code', '')}）\n"
+            f"用户问题：{pending.get('query', '')}\n"
+            f"已收集信息：{info_str}"
+        )
+        ai_msg = await session_service.add_message(
+            db=db,
+            conversation_id=conv.id,
+            role="assistant",
+            content=transfer_msg,
+            action="transfer",
+            reply_type="handoff",
+            knowledge_id=pending.get("knowledge_id"),
+            knowledge_code=pending.get("knowledge_code"),
+            intent_result={
+                "intent": "knowledge_query",
+                "via": "transfer_collection",
+                "knowledge_code": pending.get("knowledge_code"),
+                "collected_info": info_str,
+                "reason_type": "non_customer_kb",
+            },
+        )
+        await db.commit()
+        return BaseResponse(
+            data=ChatMessageResponse(
+                session_id=session_id,
+                message_id=ai_msg.message_id,
+                seq=ai_msg.seq,
+                content=transfer_msg,
+                response_type="transfer",
+                should_transfer=True,
+                evaluation_prompt="感谢您的耐心等待, 人工客服将尽快为您服务。",
+            ).model_dump()
+        )
 
     # VIN 收集 pending: 上一轮追问了VIN, 当前消息若含VIN, 直接调接口查询
     if pending and pending.get("type") == "vin_collection":
@@ -296,6 +430,14 @@ async def send_message(
         await session_service.update_session_status(
             db, session_id, "transferred",
             transfer_count=(conv.transfer_count or 0) + 1,
+        )
+        # 创建转人工工单: summary 存完整对话上下文(不做LLM摘要)
+        await session_service.create_handoff_ticket(
+            db=db,
+            session_id=session_id,
+            reason_type=reason_type,
+            reason_detail=reason,
+            priority="high" if reason_type == "risk" else "normal",
         )
         await db.commit()
 
@@ -389,14 +531,51 @@ async def send_message(
 
         if matched_ids and matched_scores and max(matched_scores) >= 0.4:
             # 获取最佳匹配
-            best = await knowledge_service.get_knowledge_by_id(db, matched_ids[0])
+            best = await knowledge_service.get_knowledge_by_id(db, matched_ids[0], req.business_area)
             if best:
-                # 品牌感知: 若该知识需要品牌(need_brand=1)
-                if best.need_brand:
+                # 是否对客判断: 命中转人工类知识 → 先用追问语收集信息, 下一轮转人工
+                if not getattr(best, "auto_reply", True):
+                    transfer_prompt = getattr(best, "transfer_prompt", "") or (
+                        "这个问题需要人工客服为您处理，正在为您转接。"
+                    )
+                    ai_msg = await session_service.add_message(
+                        db=db,
+                        conversation_id=conv.id,
+                        role="assistant",
+                        content=transfer_prompt,
+                        action="ask_info",
+                        reply_type="slot_collection",
+                        knowledge_id=best.id,
+                        knowledge_code=best.knowledge_code,
+                        intent_result={"intent": intent_type, "confidence": intent_confidence, "method": method, "transfer_pending": True},
+                    )
+                    # 记录待处理上下文, 下一轮据此转人工
+                    await session_service.set_pending_context(db, session_id, {
+                        "type": "transfer_collection",
+                        "knowledge_id": best.id,
+                        "knowledge_code": best.knowledge_code,
+                        "business_area": req.business_area,
+                        "query": req.content,
+                    })
+                    await db.commit()
+                    return BaseResponse(
+                        data=ChatMessageResponse(
+                            session_id=session_id,
+                            message_id=ai_msg.message_id,
+                            seq=ai_msg.seq,
+                            content=transfer_prompt,
+                            response_type="ask_slot",
+                            need_more_info=True,
+                            ask_slot_prompt=transfer_prompt,
+                        ).model_dump()
+                    )
+
+                # 品牌感知: 仅行车记录仪有品牌追问 (need_brand字段)
+                if req.business_area == "dashcam" and getattr(best, "need_brand", False):
                     # 用户已指定品牌 → 取该品牌的同主题知识
                     if detected_brand:
                         brand_knowledge = await _get_brand_knowledge(
-                            db, req.business_area, best.category_l2, detected_brand
+                            db, best.category_l2, detected_brand
                         )
                         if brand_knowledge:
                             best = brand_knowledge
@@ -435,7 +614,7 @@ async def send_message(
                         )
 
                 attachments = []
-                if best.need_attachment:
+                if getattr(best, "need_attachment", False) and hasattr(best, "attachments"):
                     for att in best.attachments:
                         attachments.append({"type": att.file_type or "link", "url": att.file_url, "name": att.file_name})
 
@@ -561,6 +740,14 @@ async def send_message(
     if fail_count >= 2:
         # 转人工
         await session_service.update_session_status(db, session_id, "transferred", transfer_count=(conv.transfer_count or 0) + 1)
+        # 创建转人工工单: summary 存完整对话上下文
+        await session_service.create_handoff_ticket(
+            db=db,
+            session_id=session_id,
+            reason_type="consecutive_fail",
+            reason_detail=f"连续{fail_count}轮未能解决用户问题",
+            priority="normal",
+        )
         ai_msg = await session_service.add_message(
             db=db,
             conversation_id=conv.id,
@@ -620,9 +807,18 @@ def _extract_vin(text: str) -> Optional[str]:
     return m.group(0) if m else None
 
 
+def _is_unknown_brand_response(text: str) -> bool:
+    """判断用户是否表达"不知道品牌" (触发VIN查品牌)"""
+    if not text:
+        return False
+    t = text.strip()
+    unknown_phrases = ["不知道", "不清楚", "不确定", "不晓得", "忘了", "不记得", "查一下", "帮我查"]
+    return any(p in t for p in unknown_phrases)
+
+
 def _gen_follow_ups(knowledge) -> list:
-    """生成追问建议"""
-    category = getattr(knowledge, "category_l2", "") or ""
+    """生成追问建议 (兼容dashcam的category_l2和其他业务的category)"""
+    category = getattr(knowledge, "category_l2", "") or getattr(knowledge, "category", "") or ""
     if "离线" in category or "4G" in category:
         return ["如何检查SIM卡状态?", "SIM卡怎么拔插?", "设备不定位怎么处理?"]
     elif "SIM" in category or "ID" in category:
@@ -630,21 +826,20 @@ def _gen_follow_ups(knowledge) -> list:
     return ["还有其他问题吗?", "转人工"]
 
 
-async def _get_brand_knowledge(db, business_area: str, category_l2: str, brand_name: str):
-    """取指定品牌、同主题(同category_l2)的知识条目
+async def _get_brand_knowledge(db, category_l2: str, brand_name: str):
+    """取指定品牌、同主题(同category_l2)的行车记录仪知识条目
 
     Args:
-        category_l2: 知识二级分类 (如 "4G离线排查")
+        category_l2: 知识二级分类 (如 "4G离线排查方法")
         brand_name: 用户指定的品牌名 (如 "航天")
     """
-    from app.models import KnowledgeAnswer
+    from app.models import DashcamKnowledge
     from sqlalchemy import select
-    stmt = select(KnowledgeAnswer).where(
-        KnowledgeAnswer.business_area == business_area,
-        KnowledgeAnswer.status == "published",
-        KnowledgeAnswer.need_brand == True,
-        KnowledgeAnswer.category_l2 == category_l2,
-        KnowledgeAnswer.manufacturer == brand_name,
+    stmt = select(DashcamKnowledge).where(
+        DashcamKnowledge.status == "published",
+        DashcamKnowledge.need_brand == True,
+        DashcamKnowledge.category_l2 == category_l2,
+        DashcamKnowledge.manufacturer == brand_name,
     ).limit(1)
     result = await db.execute(stmt)
     return result.scalar_one_or_none()

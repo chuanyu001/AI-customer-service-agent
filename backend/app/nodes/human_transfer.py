@@ -60,17 +60,11 @@ async def human_transfer_node(state: WorkflowState) -> WorkflowState:
         return state
 
     # ============================================
-    # Step 2: 生成对话摘要
+    # Step 2: 拼接完整对话上下文 (不做LLM摘要, 直接给人工客服)
     # ============================================
     messages = state.get("messages", [])
     if messages:
-        try:
-            conversation_text = _format_conversation(messages)
-            llm = get_llm()
-            summary = await llm.summarize(conversation_text, max_length=200)
-            state["transfer_summary"] = summary
-        except Exception:
-            state["transfer_summary"] = _simple_summary(messages, state)
+        state["transfer_summary"] = _format_conversation(messages)
     else:
         state["transfer_summary"] = f"用户问题: {state.get('query', '')}"
 
@@ -97,6 +91,7 @@ async def human_transfer_node(state: WorkflowState) -> WorkflowState:
             "consecutive_fail": "normal",
             "out_of_scope": "normal",
             "keyword": "high",
+            "non_customer_kb": "normal",
         }
         state["transfer_priority"] = priority_map.get(transfer_reason_type, "normal")
 
@@ -133,6 +128,10 @@ def _evaluate_transfer(state: WorkflowState) -> tuple:
         if op in query:
             return True, "out_of_scope", f"用户请求超出AI服务范围: {op}"
 
+    # Rule 5: 命中需人工处理的知识 (非对客类知识, 由 chat.py 设 transfer_due_to_kb 标记)
+    if state.get("transfer_due_to_kb"):
+        return True, "non_customer_kb", "命中需人工客服处理的知识"
+
     return False, "", ""
 
 
@@ -150,13 +149,13 @@ def _is_off_hours() -> bool:
 
 
 def _format_conversation(messages: list) -> str:
-    """格式化对话为文本"""
+    """格式化完整对话为文本 (给人工客服, 不截断不摘要)"""
     lines = []
-    for msg in messages[-10:]:  # 最近10条
+    for msg in messages:
         role = getattr(msg, "type", "unknown") if hasattr(msg, "type") else "unknown"
         content = getattr(msg, "content", str(msg)) if hasattr(msg, "content") else str(msg)
         role_label = "用户" if role in ("user", "human") else "客服"
-        lines.append(f"{role_label}: {content[:200]}")
+        lines.append(f"【{role_label}】{content}")
     return "\n".join(lines)
 
 
