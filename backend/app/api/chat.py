@@ -852,16 +852,20 @@ async def send_message(
             ).model_dump()
         )
 
-    # 兜底
+    # 兜底 — 意图不明确时追问, 而非直接放弃
     await session_service.update_consecutive_fail(db, session_id, increment=True)
+
+    # 尝试从低置信向量/关键词中找候选, 生成追问
+    fallback_msg = await _build_clarify_prompt(db, req.content, effective_business)
+
     ai_msg = await session_service.add_message(
         db=db,
         conversation_id=conv.id,
         role="assistant",
-        content="抱歉, 我暂时无法准确理解您的问题。请尝试用更简单的方式描述, 或输入'转人工'联系人工客服。",
-        action="auto_reply",
-        reply_type="fallback",
-        intent_result={"intent": intent_type, "confidence": intent_confidence},
+        content=fallback_msg,
+        action="ask_info",
+        reply_type="fallback_clarify",
+        intent_result={"intent": intent_type, "confidence": intent_confidence, "via": "clarify"},
     )
     await db.commit()
 
@@ -872,7 +876,7 @@ async def send_message(
             seq=ai_msg.seq,
             content=ai_msg.content,
             response_type="fallback",
-            follow_up_questions=["设备离线了怎么办?", "如何查询SIM卡号?", "转人工"],
+            follow_up_questions=["转人工"],
         ).model_dump()
     )
 
@@ -941,6 +945,47 @@ def _should_route_live_query(text: str, query_type_code: str) -> bool:
 
     return False
 
+
+async def _build_clarify_prompt(db, query: str, business_area: str) -> str:
+    """意图不明时, 从低置信候选生成追问, 引导用户澄清需求."""
+    try:
+        from app.services.knowledge_service import knowledge_service
+        from app.models import BUSINESS_KNOWLEDGE_MAP
+        from sqlalchemy import select
+
+        # 用关键词检索找可能的候选
+        kw_ids, kw_scores = await knowledge_service._keyword_match(db, query, business_area, top_k=3)
+
+        # 取向量检索兜底
+        try:
+            from app.services.embedding_service import embedding_service
+            vec_results = await embedding_service.search(query, business_area=business_area, top_k=3)
+            vec_ids = [kid for kid, _ in vec_results]
+        except Exception:
+            vec_ids = []
+
+        # 合并去重
+        all_ids = list(dict.fromkeys(list(kw_ids) + vec_ids))[:3]
+        if not all_ids:
+            return ("抱歉，我没有完全理解您的问题。您能再具体描述一下吗？\n"
+                    "比如告诉我您遇到的问题是什么、涉及到什么设备或服务。\n"
+                    "如需人工协助，请输入转人工。")
+
+        # 取候选的标准问题
+        kn_model = BUSINESS_KNOWLEDGE_MAP.get(business_area)
+        result = await db.execute(
+            select(kn_model.standard_question).where(kn_model.id.in_(all_ids))
+        )
+        candidates = [r[0] for r in result.all()]
+
+        if len(candidates) >= 2:
+            return f"我理解您想了解：\n① {candidates[0]}\n② {candidates[1]}\n\n请问您指的是哪一个？或者您可以直接描述您遇到的问题。"
+        elif candidates:
+            return f"我理解您想问的和「{candidates[0]}」有关吗？请确认一下，或者告诉我更多细节。"
+        else:
+            return "抱歉，我没有完全理解您的问题。您能再具体描述一下吗？比如告诉我您遇到的问题是什么、涉及到什么设备或服务。\n\n如需人工协助，请输入转人工。"
+    except Exception:
+        return "抱歉，我没有完全理解您的问题。您能再具体描述一下吗？\n\n如需人工协助，请输入转人工。"
 
 def _is_unknown_brand_response(text: str) -> bool:
     """判断用户是否表达"不知道品牌" (触发VIN查品牌)"""
