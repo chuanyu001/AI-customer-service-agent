@@ -578,6 +578,22 @@ async def send_message(
         )
 
         if matched_ids and matched_scores and max(matched_scores) >= 0.4:
+            # 查询太短或意图模糊时, 先追问澄清再答
+            if _needs_clarify(req.content, matched_scores, method):
+                clarify_msg = await _build_clarify_prompt(db, req.content, effective_business)
+                ai_msg = await session_service.add_message(
+                    db=db, conversation_id=conv.id, role="assistant",
+                    content=clarify_msg, action="ask_info", reply_type="clarify",
+                    intent_result={"intent": intent_type, "method": method, "via": "clarify"},
+                )
+                await session_service.update_consecutive_fail(db, session_id, increment=False)
+                await db.commit()
+                return BaseResponse(data=ChatMessageResponse(
+                    session_id=session_id, message_id=ai_msg.message_id, seq=ai_msg.seq,
+                    content=clarify_msg, response_type="ask_slot", need_more_info=True,
+                    ask_slot_prompt="请详细描述您的问题",
+                ).model_dump())
+
             # 获取最佳匹配
             best = await knowledge_service.get_knowledge_by_id(db, matched_ids[0], effective_business)
             if best:
@@ -893,6 +909,24 @@ def _extract_vin(text: str) -> Optional[str]:
     m = re.search(r"[A-HJ-NPR-Z0-9]{17}", text.upper())
     return m.group(0) if m else None
 
+
+def _needs_clarify(query: str, scores: list, method: str) -> bool:
+    """判断查询是否太模糊, 需要追问澄清.
+
+    仅在用户只扔了几个关键词、没有完整问题句时触发。
+    有疑问代词(怎么/如何/什么/为什么)的完整问题直接放过。
+    """
+    q = query.strip()
+    # 含疑问词 → 用户已经表达了完整问题
+    if any(w in q for w in ["怎么", "如何", "什么", "为什么", "哪", "吗", "呢"]):
+        return False
+    # 极短 (< 5字) 且不含具体对象 → 太模糊
+    if len(q) < 5:
+        return True
+    # 候选分数太接近 → 意图不明确
+    if len(scores) >= 2 and (scores[0] - scores[1]) < 0.05:
+        return True
+    return False
 
 def _detect_business_area(text: str, fallback: str) -> str:
     """根据消息内容自动推断业务域，减少用户切业务的成本。
