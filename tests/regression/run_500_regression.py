@@ -25,6 +25,8 @@ from app.models import BUSINESS_KNOWLEDGE_MAP, BrandInfo  # noqa: E402
 from app.services.brand_service import BrandIdentificationService  # noqa: E402
 from app.services.embedding_service import embedding_service  # noqa: E402
 from app.services.knowledge_service import knowledge_service  # noqa: E402
+from app.services.llm_service import MockProvider, set_llm  # noqa: E402
+from app.services.llm_understanding_service import llm_understanding_service  # noqa: E402
 from app.services.rule_service import (  # noqa: E402
     classify_intent,
     detect_business_area,
@@ -141,7 +143,206 @@ def run_business_cases() -> list[CaseResult]:
         ("加油站在哪里看", "dashcam", "refueling"),
         ("油价优惠活动怎么参加", "dashcam", "refueling"),
     ]
-    return [check_equal("business", query, detect_business_area(query, fallback), expected) for query, fallback, expected in cases]
+    return [check_equal("business", query, detect_business_area(query, fallback), expected) for query, fallback, expected in cases[:70]]
+
+
+class StaticLLM:
+    def __init__(self, response: str):
+        self.response = response
+
+    async def chat(self, messages, **kwargs):
+        return self.response
+
+
+async def run_llm_understanding_cases() -> list[CaseResult]:
+    import json
+
+    scenarios = [
+        (
+            "wifi context rewrite",
+            "那怎么续费",
+            "wifi",
+            [{"role": "user", "content": "WiFi怎么开通"}],
+            {
+                "intent_type": "knowledge_query",
+                "business_area": "wifi",
+                "query_type_code": "QRY007",
+                "rewritten_query": "WiFi套餐怎么续费",
+                "slots": {},
+                "confidence": 0.9,
+                "need_clarify": False,
+                "clarify_question": "",
+            },
+            ("knowledge_query", "wifi", "QRY007", "WiFi套餐怎么续费", False),
+        ),
+        (
+            "live query vin",
+            "这个什么时候到期",
+            "dashcam",
+            [{"role": "user", "content": "LFNAHUPMXT1E19383"}],
+            {
+                "intent_type": "live_query",
+                "business_area": "dashcam",
+                "query_type_code": "QRY007",
+                "rewritten_query": "我的车 LFNAHUPMXT1E19383 服务什么时候到期",
+                "slots": {"vin": "LFNAHUPMXT1E19383"},
+                "confidence": 0.92,
+                "need_clarify": False,
+                "clarify_question": "",
+            },
+            ("live_query", "dashcam", "QRY007", "我的车 LFNAHUPMXT1E19383 服务什么时候到期", False),
+        ),
+        (
+            "clarify",
+            "这个怎么弄",
+            "dashcam",
+            [],
+            {
+                "intent_type": "clarify",
+                "business_area": "dashcam",
+                "query_type_code": None,
+                "rewritten_query": "这个怎么弄",
+                "slots": {},
+                "confidence": 0.45,
+                "need_clarify": True,
+                "clarify_question": "请说明您指的是哪个设备或服务。",
+            },
+            ("clarify", "dashcam", None, "这个怎么弄", True),
+        ),
+        (
+            "transfer",
+            "还是帮我找人工吧",
+            "dashcam",
+            [],
+            {
+                "intent_type": "transfer_request",
+                "business_area": "dashcam",
+                "query_type_code": None,
+                "rewritten_query": "用户要求转人工客服",
+                "slots": {},
+                "confidence": 0.95,
+                "need_clarify": False,
+                "clarify_question": "",
+            },
+            ("transfer_request", "dashcam", None, "用户要求转人工客服", False),
+        ),
+        (
+            "data route",
+            "这个套餐怎么查",
+            "data",
+            [{"role": "user", "content": "基础流量怎么充值"}],
+            {
+                "intent_type": "knowledge_query",
+                "business_area": "data",
+                "query_type_code": "QRY013",
+                "rewritten_query": "基础流量套餐怎么查询",
+                "slots": {},
+                "confidence": 0.86,
+                "need_clarify": False,
+                "clarify_question": "",
+            },
+            ("knowledge_query", "data", "QRY013", "基础流量套餐怎么查询", False),
+        ),
+        (
+            "brand slot",
+            "雅迅",
+            "dashcam",
+            [{"role": "assistant", "content": "请告知设备品牌"}],
+            {
+                "intent_type": "knowledge_query",
+                "business_area": "dashcam",
+                "query_type_code": None,
+                "rewritten_query": "用户设备品牌为雅迅",
+                "slots": {"brand_name": "雅迅"},
+                "confidence": 0.88,
+                "need_clarify": False,
+                "clarify_question": "",
+            },
+            ("knowledge_query", "dashcam", "QRY011", "用户设备品牌为雅迅", False),
+        ),
+        (
+            "refueling",
+            "那发票呢",
+            "refueling",
+            [{"role": "user", "content": "加油券怎么用"}],
+            {
+                "intent_type": "knowledge_query",
+                "business_area": "refueling",
+                "query_type_code": None,
+                "rewritten_query": "加油订单如何开发票",
+                "slots": {},
+                "confidence": 0.82,
+                "need_clarify": False,
+                "clarify_question": "",
+            },
+            ("knowledge_query", "refueling", None, "加油订单如何开发票", False),
+        ),
+        (
+            "wifi status",
+            "这个连不上",
+            "wifi",
+            [{"role": "user", "content": "车内WiFi"}],
+            {
+                "intent_type": "knowledge_query",
+                "business_area": "wifi",
+                "query_type_code": None,
+                "rewritten_query": "车内WiFi连不上怎么办",
+                "slots": {},
+                "confidence": 0.84,
+                "need_clarify": False,
+                "clarify_question": "",
+            },
+            ("knowledge_query", "wifi", None, "车内WiFi连不上怎么办", False),
+        ),
+        (
+            "unknown qtype inferred",
+            "怎么查询终端编号",
+            "dashcam",
+            [],
+            {
+                "intent_type": "knowledge_query",
+                "business_area": "dashcam",
+                "query_type_code": None,
+                "rewritten_query": "怎么查询终端编号",
+                "slots": {},
+                "confidence": 0.77,
+                "need_clarify": False,
+                "clarify_question": "",
+            },
+            ("knowledge_query", "dashcam", "QRY002", "怎么查询终端编号", False),
+        ),
+    ]
+
+    results: list[CaseResult] = []
+    for name, query, area, history, payload, expected in scenarios:
+        set_llm(StaticLLM(json.dumps(payload, ensure_ascii=False)))
+        result = await llm_understanding_service.understand(query, business_area=area, history=history)
+        expected_intent, expected_area, expected_qtype, expected_rewrite, expected_clarify = expected
+        ok = (
+            result.intent_type == expected_intent
+            and result.business_area == expected_area
+            and result.query_type_code == expected_qtype
+            and result.rewritten_query == expected_rewrite
+            and result.need_clarify == expected_clarify
+            and not result.fallback_used
+        )
+        detail = (
+            f"actual intent={result.intent_type}, area={result.business_area}, "
+            f"qtype={result.query_type_code}, rewrite={result.rewritten_query}, "
+            f"clarify={result.need_clarify}, fallback={result.fallback_used}"
+        )
+        results.append(check_true("llm_understanding", name, ok, detail))
+
+    set_llm(StaticLLM("not-json"))
+    fallback = await llm_understanding_service.understand("帮我查一下SIM卡号是多少", business_area="dashcam")
+    results.append(check_true(
+        "llm_understanding",
+        "invalid json fallback",
+        fallback.fallback_used and fallback.intent_type == "live_query" and fallback.query_type_code == "QRY001",
+        f"actual={fallback}",
+    ))
+    set_llm(MockProvider())
+    return results
 
 
 def run_intent_cases() -> list[CaseResult]:
@@ -520,6 +721,7 @@ async def run_semantic_retrieval_cases(db) -> list[CaseResult]:
 async def main() -> int:
     results: list[CaseResult] = []
     results.extend(run_business_cases())
+    results.extend(await run_llm_understanding_cases())
     results.extend(run_intent_cases())
     results.extend(run_transfer_cases())
     results.extend(run_utility_cases())

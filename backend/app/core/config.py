@@ -60,13 +60,16 @@ class Settings(BaseSettings):
     # local  = 本地 Ollama (无需 API_KEY)
     # doubao = 火山方舟/豆包 (OpenAI 兼容, 需 LLM_API_KEY + LLM_MODEL=ep-xxx)
     # mock   = 规则兜底, 不依赖任何大模型
-    LLM_PROVIDER: Literal["local", "doubao", "mock"] = "local"
+    LLM_PROVIDER: Literal["local", "doubao", "mock"] = "doubao"
     LLM_BASE_URL: str = "http://localhost:11434/v1"
     LLM_API_KEY: str = ""  # doubao 用; local 留空
     LLM_MODEL: str = "qwen2.5:7b"  # doubao 填推理接入点 ID, 如 ep-20240xxxxxx-xxxxx
     LLM_TEMPERATURE: float = 0.3
     LLM_MAX_TOKENS: int = 2048
     LLM_TIMEOUT: int = 30
+    ENABLE_LLM_UNDERSTANDING: bool = True
+    LLM_UNDERSTANDING_TIMEOUT: int = 8
+    LLM_UNDERSTANDING_HISTORY_LIMIT: int = 6
 
     # 备用LLM (保留兼容, 一般不用)
     BACKUP_LLM_PROVIDER: str = "doubao"

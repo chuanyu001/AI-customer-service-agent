@@ -150,7 +150,7 @@ PERSONAL_QUERY_MARKERS = (
 
 QUERY_INTENT_PATTERNS = (
     (r"(sim|卡号|iccid)", "QRY001"),
-    (r"(终端号|设备号|设备id|device.?id)", "QRY002"),
+    (r"(终端号|终端编号|设备号|设备编号|设备id|device.?id)", "QRY002"),
     (r"(sim.*终端|终端.*sim|卡号.*终端|id.*sim)", "QRY003"),
     (r"(服务商|运营商)", "QRY004"),
     (r"(司机卡|驾驶员卡|ic卡)", "QRY005"),

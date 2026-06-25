@@ -1,6 +1,6 @@
 # 当前项目状态
 
-更新日期: 2026-06-25
+更新日期: 2026-06-26
 
 ## 主链路现状
 
@@ -11,10 +11,12 @@
 ```text
 用户消息
 → chat.py 保存会话消息
-→ rule_service 识别业务域/转人工/问候/意图
+→ 强规则拦截转人工/高风险/超权限/问候
+→ LLM理解: 最近6条消息 + pending + memory → intent/business/slots/rewritten_query
 → live_query: 收集 VIN 后查运营平台
-→ knowledge_query: 精确匹配 → 本地向量检索 → 低置信 LLM 重排
+→ knowledge_query: 原问题精确 → 改写问题精确 → 改写问题向量检索 → 低置信 LLM 重排
 → 品牌追问/是否对客/转人工工单
+→ 更新当前 session memory
 ```
 
 LangGraph 文件仍保留:
@@ -51,18 +53,17 @@ keyword_rule active 数据
 
 泛词 `套餐/充值/续费/发票` 不单独决定业务域，避免把 `设备怎么续费` 错路由到流量。
 
-### 意图识别
+### LLM理解与意图识别
 
-正常主路径不调用大模型分类。
+正常主路径优先调用豆包做理解，不让大模型自由生成答案。
 
 ```text
-问候 → greeting
-显式转人工 → transfer_request
-dashcam + 本人数据查询 → live_query
-其他 → knowledge_query
+强规则安全拦截
+→ 豆包输出 intent_type/business_area/query_type_code/rewritten_query/slots
+→ 豆包失败或非法JSON时 rule_service 降级
 ```
 
-`怎么/如何/步骤/教程` 这类教程问法优先走知识库；`我的/帮我查/是多少/到期时间/状态怎么样` 这类本人数据问法才走运营平台查询。
+当前会话记忆保存在 `conversation.metadata.memory`，只在本次 session 内使用，不做跨会话长期画像。
 
 ### 知识检索
 
@@ -71,8 +72,9 @@ dashcam + 本人数据查询 → live_query
 当前顺序:
 
 ```text
-精确标准问/问法变体
-→ 本地向量检索
+原问题精确标准问/问法变体
+→ 改写问题精确标准问/问法变体
+→ 改写问题本地向量检索
 → 低置信时可选 LLM 候选重排
 → 追问/兜底
 ```
@@ -137,9 +139,10 @@ Passed: 500
 Failed: 0
 Groups:
   brand: 50/50
-  business: 80/80
+  business: 70/70
   database: 9/9
   intent: 100/100
+  llm_understanding: 10/10
   retrieval_exact: 172/172
   retrieval_semantic: 12/12
   transfer: 60/60

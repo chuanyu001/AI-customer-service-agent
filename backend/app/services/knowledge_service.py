@@ -75,6 +75,44 @@ class KnowledgeRetrievalService:
             return vector_ids[:top_k], vector_scores[:top_k], "vector_low"
         return [], [], "none"
 
+    async def retrieve_with_rewrite(
+        self,
+        db: AsyncSession,
+        original_query: str,
+        rewritten_query: str,
+        business_area: str = "dashcam",
+        top_k: int = 5,
+    ) -> Tuple[List[int], List[float], str]:
+        """Retrieval path for LLM understanding.
+
+        Order is intentionally narrower than retrieve():
+        original exact -> rewritten exact -> rewritten vector -> optional rerank.
+        """
+        original = (original_query or "").strip()
+        rewritten = (rewritten_query or original).strip() or original
+
+        ids, scores = await self._exact_match(db, original, business_area, top_k)
+        if ids and scores and max(scores) >= 0.8:
+            return ids, scores, "exact_original"
+
+        if rewritten and rewritten != original:
+            ids, scores = await self._exact_match(db, rewritten, business_area, top_k)
+            if ids and scores and max(scores) >= 0.8:
+                return ids, scores, "exact_rewritten"
+
+        vector_ids, vector_scores = await self._vector_match(rewritten, business_area)
+        if self._is_confident_vector(vector_scores):
+            return vector_ids[:top_k], vector_scores[:top_k], "vector_rewritten"
+
+        if vector_ids and settings.ENABLE_LLM_RERANK:
+            reranked = await self._llm_rerank(db, rewritten, business_area, vector_ids, top_k)
+            if reranked:
+                return reranked, [0.66 * (0.95 ** i) for i in range(len(reranked))], "llm_rerank_rewritten"
+
+        if vector_ids and vector_scores and max(vector_scores) >= settings.VECTOR_LOW_SCORE:
+            return vector_ids[:top_k], vector_scores[:top_k], "vector_low_rewritten"
+        return [], [], "none"
+
     async def _vector_match(
         self, query: str, business_area: str
     ) -> Tuple[List[int], List[float]]:

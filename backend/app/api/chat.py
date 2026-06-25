@@ -28,13 +28,13 @@ brand_service = BrandIdentificationService()
 from app.graph.workflow import agent_workflow
 from app.graph.state import WorkflowState
 from app.services.rule_service import (
-    classify_intent,
     detect_business_area,
     evaluate_transfer,
     is_greeting,
     needs_clarify,
     should_route_live_query,
 )
+from app.services.llm_understanding_service import llm_understanding_service
 
 router = APIRouter(prefix="/chat", tags=["Chat"])
 
@@ -534,16 +534,150 @@ async def send_message(
                     logger.info(f"[VIN主动识别] VIN={vin} 未匹配到品牌, 走正常流程")
 
     # ============================================
-    # Step 4: 运行简化版工作流 (不使用LangGraph runtime, 直接调用)
+    # Step 4: LLM理解 + 规则降级 (不使用LangGraph runtime, 直接调用)
     # ============================================
-    # 4.1 规则优先意图识别: 正常主路径不再调用大模型分类
-    intent_decision = classify_intent(req.content, req.business_area)
-    effective_business = intent_decision.business_area
-    qtype = intent_decision.query_type_code
-    intent_type = intent_decision.intent_type
-    intent_confidence = intent_decision.confidence
+    # 强规则已在前面拦截。正常主路径由大模型理解真实意图、补全上下文和抽取槽位；
+    # 大模型失败时 llm_understanding_service 会自动降级到当前规则识别。
+    recent_messages = await session_service.get_recent_messages(
+        db,
+        conv.id,
+        limit=settings.LLM_UNDERSTANDING_HISTORY_LIMIT,
+    )
+    memory = await session_service.get_memory_context(db, session_id)
+    current_pending = await session_service.get_pending_context(db, session_id)
+    understanding = await llm_understanding_service.understand(
+        req.content,
+        business_area=effective_business,
+        history=recent_messages,
+        pending=current_pending,
+        memory=memory,
+    )
+    effective_business = understanding.business_area
+    qtype = understanding.query_type_code
+    intent_type = understanding.intent_type
+    intent_confidence = understanding.confidence
+    retrieval_query = understanding.rewritten_query or req.content
 
-    logger.info(f"[意图识别] query='{req.content}' -> intent={intent_type} conf={intent_confidence:.2f}")
+    logger.info(
+        "[LLM理解] query='%s' -> intent=%s business=%s qtype=%s conf=%.2f method=%s rewritten='%s'",
+        req.content,
+        intent_type,
+        effective_business,
+        qtype,
+        intent_confidence,
+        understanding.method,
+        retrieval_query,
+    )
+
+    if intent_type == "greeting":
+        faq_cards = await knowledge_service.get_faq_cards(db, effective_business)
+        follow_ups = [c.title for c in faq_cards[:5]]
+        content = "您好! 我是AI客服助手, 请问有什么可以帮您的?"
+        ai_msg = await session_service.add_message(
+            db=db,
+            conversation_id=conv.id,
+            role="assistant",
+            content=content,
+            action="auto_reply",
+            reply_type="greeting",
+            intent_result=understanding.to_dict(),
+        )
+        await session_service.update_consecutive_fail(db, session_id, increment=False)
+        await session_service.update_memory_context(
+            db,
+            session_id,
+            user_query=req.content,
+            assistant_reply=content,
+            understanding=understanding.to_dict(),
+        )
+        await db.commit()
+
+        return BaseResponse(
+            data=ChatMessageResponse(
+                session_id=session_id,
+                message_id=ai_msg.message_id,
+                seq=ai_msg.seq,
+                content=content,
+                response_type="greeting",
+                follow_up_questions=follow_ups,
+            ).model_dump()
+        )
+
+    if intent_type in {"transfer_request", "out_of_scope"}:
+        reason_type = "out_of_scope" if intent_type == "out_of_scope" else "user_request"
+        reason = "大模型识别该问题需要人工处理"
+        await session_service.update_session_status(
+            db,
+            session_id,
+            "transferred",
+            transfer_count=(conv.transfer_count or 0) + 1,
+        )
+        await session_service.create_handoff_ticket(
+            db=db,
+            session_id=session_id,
+            reason_type=reason_type,
+            reason_detail=reason,
+            priority="normal",
+        )
+        transfer_msg = f"检测到您的问题需要人工处理（{reason}），正在为您转接人工客服，请稍候..."
+        ai_msg = await session_service.add_message(
+            db=db,
+            conversation_id=conv.id,
+            role="assistant",
+            content=transfer_msg,
+            action="transfer",
+            reply_type="handoff",
+            intent_result=understanding.to_dict(),
+        )
+        await session_service.update_memory_context(
+            db,
+            session_id,
+            user_query=req.content,
+            assistant_reply=transfer_msg,
+            understanding=understanding.to_dict(),
+        )
+        await db.commit()
+
+        return BaseResponse(
+            data=ChatMessageResponse(
+                session_id=session_id,
+                message_id=ai_msg.message_id,
+                seq=ai_msg.seq,
+                content=transfer_msg,
+                response_type="transfer",
+                should_transfer=True,
+                evaluation_prompt="感谢您的耐心等待, 人工客服将尽快为您服务。",
+            ).model_dump()
+        )
+
+    if intent_type == "clarify" or understanding.need_clarify:
+        clarify_msg = understanding.clarify_question or await _build_clarify_prompt(
+            db, retrieval_query, effective_business
+        )
+        ai_msg = await session_service.add_message(
+            db=db,
+            conversation_id=conv.id,
+            role="assistant",
+            content=clarify_msg,
+            action="ask_info",
+            reply_type="clarify",
+            intent_result=understanding.to_dict(),
+        )
+        await session_service.update_consecutive_fail(db, session_id, increment=False)
+        await session_service.update_memory_context(
+            db,
+            session_id,
+            user_query=req.content,
+            assistant_reply=clarify_msg,
+            understanding=understanding.to_dict(),
+        )
+        await db.commit()
+
+        return BaseResponse(data=ChatMessageResponse(
+            session_id=session_id, message_id=ai_msg.message_id, seq=ai_msg.seq,
+            content=clarify_msg, response_type="ask_slot", need_more_info=True,
+            ask_slot_prompt=clarify_msg,
+        ).model_dump())
 
     # 4.2 知识库检索
     if intent_type == "knowledge_query":
@@ -551,14 +685,17 @@ async def send_message(
         detected_brand = None
         try:
             brand_result = await brand_service.identify_by_keyword(req.content)
+            if not brand_result and retrieval_query != req.content:
+                brand_result = await brand_service.identify_by_keyword(retrieval_query)
             if brand_result and brand_result.confidence >= 0.8:
                 detected_brand = brand_result.brand_name
         except Exception:
             pass
 
-        matched_ids, matched_scores, method = await knowledge_service.retrieve(
+        matched_ids, matched_scores, method = await knowledge_service.retrieve_with_rewrite(
             db=db,
-            query=req.content,
+            original_query=req.content,
+            rewritten_query=retrieval_query,
             business_area=effective_business,
             top_k=5,
         )
@@ -570,9 +707,24 @@ async def send_message(
                 ai_msg = await session_service.add_message(
                     db=db, conversation_id=conv.id, role="assistant",
                     content=clarify_msg, action="ask_info", reply_type="clarify",
-                    intent_result={"intent": intent_type, "method": method, "via": "clarify"},
+                    intent_result={
+                        **understanding.to_dict(),
+                        "intent": intent_type,
+                        "method": method,
+                        "via": "clarify",
+                    },
                 )
                 await session_service.update_consecutive_fail(db, session_id, increment=False)
+                await session_service.update_memory_context(
+                    db,
+                    session_id,
+                    user_query=req.content,
+                    assistant_reply=clarify_msg,
+                    understanding={
+                        **understanding.to_dict(),
+                        "retrieval_method": method,
+                    },
+                )
                 await db.commit()
                 return BaseResponse(data=ChatMessageResponse(
                     session_id=session_id, message_id=ai_msg.message_id, seq=ai_msg.seq,
@@ -606,7 +758,24 @@ async def send_message(
                         reply_type="handoff",
                         knowledge_id=best.id,
                         knowledge_code=best.knowledge_code,
-                        intent_result={"intent": intent_type, "confidence": intent_confidence, "method": method},
+                        intent_result={
+                            **understanding.to_dict(),
+                            "intent": intent_type,
+                            "confidence": intent_confidence,
+                            "method": method,
+                            "knowledge_code": best.knowledge_code,
+                        },
+                    )
+                    await session_service.update_memory_context(
+                        db,
+                        session_id,
+                        user_query=req.content,
+                        assistant_reply=ai_msg.content,
+                        understanding={
+                            **understanding.to_dict(),
+                            "retrieval_method": method,
+                            "knowledge_code": best.knowledge_code,
+                        },
                     )
                     await db.commit()
                     return BaseResponse(
@@ -635,7 +804,14 @@ async def send_message(
                         reply_type="slot_collection",
                         knowledge_id=best.id,
                         knowledge_code=best.knowledge_code,
-                        intent_result={"intent": intent_type, "confidence": intent_confidence, "method": method, "transfer_pending": True},
+                        intent_result={
+                            **understanding.to_dict(),
+                            "intent": intent_type,
+                            "confidence": intent_confidence,
+                            "method": method,
+                            "transfer_pending": True,
+                            "knowledge_code": best.knowledge_code,
+                        },
                     )
                     # 记录待处理上下文, 下一轮据此转人工
                     await session_service.set_pending_context(db, session_id, {
@@ -645,6 +821,17 @@ async def send_message(
                         "business_area": effective_business,
                         "query": req.content,
                     })
+                    await session_service.update_memory_context(
+                        db,
+                        session_id,
+                        user_query=req.content,
+                        assistant_reply=transfer_prompt,
+                        understanding={
+                            **understanding.to_dict(),
+                            "retrieval_method": method,
+                            "knowledge_code": best.knowledge_code,
+                        },
+                    )
                     await db.commit()
                     return BaseResponse(
                         data=ChatMessageResponse(
@@ -679,7 +866,13 @@ async def send_message(
                             reply_type="brand_collection",
                             knowledge_id=best.id,
                             knowledge_code=best.knowledge_code,
-                            intent_result={"intent": intent_type, "confidence": intent_confidence, "method": method},
+                            intent_result={
+                                **understanding.to_dict(),
+                                "intent": intent_type,
+                                "confidence": intent_confidence,
+                                "method": method,
+                                "knowledge_code": best.knowledge_code,
+                            },
                         )
                         # 记录待处理上下文, 下一轮据此识别用户回答的品牌
                         await session_service.set_pending_context(db, session_id, {
@@ -687,6 +880,17 @@ async def send_message(
                             "knowledge_id": best.id,
                             "category_l2": best.category_l2,
                         })
+                        await session_service.update_memory_context(
+                            db,
+                            session_id,
+                            user_query=req.content,
+                            assistant_reply=brand_prompt,
+                            understanding={
+                                **understanding.to_dict(),
+                                "retrieval_method": method,
+                                "knowledge_code": best.knowledge_code,
+                            },
+                        )
                         await db.commit()
                         return BaseResponse(
                             data=ChatMessageResponse(
@@ -720,9 +924,28 @@ async def send_message(
                     reply_type="knowledge_answer",
                     knowledge_id=best.id,
                     knowledge_code=best.knowledge_code,
-                    intent_result={"intent": intent_type, "confidence": intent_confidence, "brand": detected_brand, "method": method},
+                    intent_result={
+                        **understanding.to_dict(),
+                        "intent": intent_type,
+                        "confidence": intent_confidence,
+                        "brand": detected_brand,
+                        "method": method,
+                        "knowledge_code": best.knowledge_code,
+                    },
                 )
                 await session_service.update_consecutive_fail(db, session_id, increment=False)
+                await session_service.update_memory_context(
+                    db,
+                    session_id,
+                    user_query=req.content,
+                    assistant_reply=reply_content,
+                    understanding={
+                        **understanding.to_dict(),
+                        "retrieval_method": method,
+                        "knowledge_code": best.knowledge_code,
+                    },
+                    slots={"brand_name": detected_brand} if detected_brand else None,
+                )
                 await db.commit()
 
                 return BaseResponse(
@@ -744,7 +967,11 @@ async def send_message(
         from app.integrations.platform_client import platform_client
 
         # 先尝试从用户消息提取 VIN (运营平台接口仅支持 VIN 查询)
-        vin = _extract_vin(req.content)
+        vin = (
+            understanding.slots.get("vin")
+            or _extract_vin(req.content)
+            or _extract_vin(retrieval_query)
+        )
 
         if qtype and vin:
             # 有 VIN → 调运营平台接口实时查询
@@ -775,9 +1002,22 @@ async def send_message(
                 action="query",
                 reply_type=reply_type,
                 query_type_code=qtype,
-                intent_result={"intent": intent_type, "confidence": intent_confidence, "vin": vin},
+                intent_result={
+                    **understanding.to_dict(),
+                    "intent": intent_type,
+                    "confidence": intent_confidence,
+                    "vin": vin,
+                },
             )
             await session_service.update_consecutive_fail(db, session_id, increment=False)
+            await session_service.update_memory_context(
+                db,
+                session_id,
+                user_query=req.content,
+                assistant_reply=content,
+                understanding=understanding.to_dict(),
+                slots={"vin": vin},
+            )
             await db.commit()
 
             return BaseResponse(
@@ -800,12 +1040,23 @@ async def send_message(
                 action="ask_info",
                 reply_type="slot_collection",
                 query_type_code=qtype,
-                intent_result={"intent": intent_type, "confidence": intent_confidence},
+                intent_result={
+                    **understanding.to_dict(),
+                    "intent": intent_type,
+                    "confidence": intent_confidence,
+                },
             )
             await session_service.set_pending_context(db, session_id, {
                 "type": "vin_collection",
                 "query_type_code": qtype,
             })
+            await session_service.update_memory_context(
+                db,
+                session_id,
+                user_query=req.content,
+                assistant_reply=ai_msg.content,
+                understanding=understanding.to_dict(),
+            )
             await db.commit()
 
             return BaseResponse(
@@ -840,6 +1091,19 @@ async def send_message(
             content="多次未能解决您的问题, 正在为您转接人工客服...",
             action="transfer",
             reply_type="handoff",
+            intent_result={
+                **understanding.to_dict(),
+                "intent": intent_type,
+                "confidence": intent_confidence,
+                "via": "consecutive_fail",
+            },
+        )
+        await session_service.update_memory_context(
+            db,
+            session_id,
+            user_query=req.content,
+            assistant_reply=ai_msg.content,
+            understanding=understanding.to_dict(),
         )
         await db.commit()
 
@@ -867,7 +1131,19 @@ async def send_message(
         content=fallback_msg,
         action="ask_info",
         reply_type="fallback_clarify",
-        intent_result={"intent": intent_type, "confidence": intent_confidence, "via": "clarify"},
+        intent_result={
+            **understanding.to_dict(),
+            "intent": intent_type,
+            "confidence": intent_confidence,
+            "via": "clarify",
+        },
+    )
+    await session_service.update_memory_context(
+        db,
+        session_id,
+        user_query=req.content,
+        assistant_reply=fallback_msg,
+        understanding=understanding.to_dict(),
     )
     await db.commit()
 

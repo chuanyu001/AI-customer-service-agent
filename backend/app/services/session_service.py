@@ -76,6 +76,108 @@ class SessionService:
         return result.scalar_one_or_none()
 
     @staticmethod
+    async def get_recent_messages(
+        db: AsyncSession,
+        conversation_id: int,
+        limit: int = 6,
+    ) -> List[Dict[str, Any]]:
+        """Return recent messages in chronological order for LLM context."""
+        stmt = (
+            select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .order_by(Message.seq.desc())
+            .limit(limit)
+        )
+        result = await db.execute(stmt)
+        rows = list(result.scalars().all())
+        rows.reverse()
+        return [
+            {
+                "role": msg.role,
+                "content": msg.content,
+                "seq": msg.seq,
+                "reply_type": msg.reply_type,
+                "knowledge_code": msg.knowledge_code,
+            }
+            for msg in rows
+        ]
+
+    @staticmethod
+    async def get_memory_context(
+        db: AsyncSession,
+        session_id: str,
+    ) -> Dict[str, Any]:
+        """Read current-session memory from conversation.metadata."""
+        conv = await SessionService.get_session(db, session_id)
+        if not conv or not conv.extra_metadata:
+            return {"summary": "", "slots": {}, "last_intent": None}
+        memory = conv.extra_metadata.get("memory") or {}
+        if not isinstance(memory, dict):
+            return {"summary": "", "slots": {}, "last_intent": None}
+        return {
+            "summary": memory.get("summary", ""),
+            "slots": memory.get("slots") or {},
+            "last_intent": memory.get("last_intent"),
+            "last_business_area": memory.get("last_business_area"),
+            "last_query_type_code": memory.get("last_query_type_code"),
+            "last_rewritten_query": memory.get("last_rewritten_query"),
+        }
+
+    @staticmethod
+    async def update_memory_context(
+        db: AsyncSession,
+        session_id: str,
+        *,
+        user_query: str,
+        assistant_reply: str = "",
+        understanding: Optional[Dict[str, Any]] = None,
+        slots: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Update current-session memory with latest slots and short summary."""
+        conv = await SessionService.get_session(db, session_id)
+        if not conv:
+            return
+
+        metadata = dict(conv.extra_metadata or {})
+        old_memory = metadata.get("memory") if isinstance(metadata.get("memory"), dict) else {}
+        old_slots = dict(old_memory.get("slots") or {})
+
+        merged_slots = dict(old_slots)
+        for source in ((understanding or {}).get("slots") or {}, slots or {}):
+            if not isinstance(source, dict):
+                continue
+            for key, value in source.items():
+                if value is None:
+                    continue
+                text = str(value).strip()
+                if text:
+                    merged_slots[key] = text
+
+        summary_lines = []
+        old_summary = str(old_memory.get("summary") or "").strip()
+        if old_summary:
+            summary_lines.append(old_summary)
+        if user_query:
+            summary_lines.append(f"用户: {user_query.strip()[:200]}")
+        if assistant_reply:
+            summary_lines.append(f"客服: {assistant_reply.strip()[:200]}")
+        summary = "\n".join(summary_lines)
+        if len(summary) > 1200:
+            summary = summary[-1200:]
+
+        understanding = understanding or {}
+        metadata["memory"] = {
+            "summary": summary,
+            "slots": merged_slots,
+            "last_intent": understanding.get("intent_type"),
+            "last_business_area": understanding.get("business_area"),
+            "last_query_type_code": understanding.get("query_type_code"),
+            "last_rewritten_query": understanding.get("rewritten_query"),
+        }
+        conv.extra_metadata = metadata
+        await db.flush()
+
+    @staticmethod
     async def add_message(
         db: AsyncSession,
         conversation_id: int,
