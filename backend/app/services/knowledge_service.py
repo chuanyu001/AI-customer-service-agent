@@ -66,7 +66,8 @@ class KnowledgeRetrievalService:
 
         # L3: 关键词兜底, 补强业务术语/短词/型号类命中
         kw_ids, kw_scores = await self._keyword_match(db, query, business_area, top_k)
-        if kw_ids and kw_scores and max(kw_scores) >= 0.75 and not vector_ids:
+        # 向量返回空时, 关键词高分往往是"怎么/什么"等通用词噪声 → 不可信
+        if kw_ids and kw_scores and max(kw_scores) >= 0.75 and vector_ids:
             return kw_ids, kw_scores, "keyword"
 
         # L4: 低置信候选重排. 只给大模型 topK 候选, 不再传全量知识库。

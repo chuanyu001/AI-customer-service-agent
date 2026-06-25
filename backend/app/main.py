@@ -78,7 +78,17 @@ async def _load_embeddings() -> int:
 
         factory = get_session_factory()
         async with factory() as db:
-            return await embedding_service.load_to_memory(db)
+            count = await embedding_service.load_to_memory(db)
+
+        # 预热本地模型, 避免第一个用户请求等7秒+
+        if settings.EMBEDDING_PROVIDER == "local" and count > 0:
+            try:
+                _ = embedding_service.encode("预热")
+                logger.info("Embedding 模型预热完成")
+            except Exception:
+                pass
+
+        return count
     except Exception as e:
         logger.warning("知识向量缓存加载失败, 将跳过向量检索: %s", e)
         return 0

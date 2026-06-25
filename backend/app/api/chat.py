@@ -542,11 +542,15 @@ async def send_message(
     # ============================================
     # Step 4: 运行简化版工作流 (不使用LangGraph runtime, 直接调用)
     # ============================================
+    # 自动业务路由: 根据消息关键词推断业务域
+    effective_business = _detect_business_area(req.content, req.business_area)
+
     # 4.1 规则优先意图识别: 正常主路径不再调用大模型分类
     from app.nodes.query_judgment import _match_query_type
 
     qtype = _match_query_type(req.content)
-    if qtype and _should_route_live_query(req.content, qtype):
+    # 仅行车记录仪业务支持运营平台实时查询, WiFi/流量/加油是纯知识问答
+    if effective_business == "dashcam" and qtype and _should_route_live_query(req.content, qtype):
         intent_type = "live_query"
         intent_confidence = 0.9
     else:
@@ -569,13 +573,13 @@ async def send_message(
         matched_ids, matched_scores, method = await knowledge_service.retrieve(
             db=db,
             query=req.content,
-            business_area=req.business_area,
+            business_area=effective_business,
             top_k=5,
         )
 
         if matched_ids and matched_scores and max(matched_scores) >= 0.4:
             # 获取最佳匹配
-            best = await knowledge_service.get_knowledge_by_id(db, matched_ids[0], req.business_area)
+            best = await knowledge_service.get_knowledge_by_id(db, matched_ids[0], effective_business)
             if best:
                 # 高风险知识条目不直接对客, 进入人工处理
                 if getattr(best, "risk_level", "low") == "high":
@@ -653,7 +657,7 @@ async def send_message(
                     )
 
                 # 品牌感知: 仅行车记录仪有品牌追问 (need_brand字段)
-                if req.business_area == "dashcam" and getattr(best, "need_brand", False):
+                if effective_business == "dashcam" and getattr(best, "need_brand", False):
                     # 用户已指定品牌 → 取该品牌的同主题知识
                     if detected_brand:
                         brand_knowledge = await _get_brand_knowledge(
@@ -886,6 +890,24 @@ def _extract_vin(text: str) -> Optional[str]:
     return m.group(0) if m else None
 
 
+def _detect_business_area(text: str, fallback: str) -> str:
+    """根据消息内容自动推断业务域，减少用户切业务的成本。
+
+    流量/WiFi/加油有明确关键词，命中直接路由。
+    其他情况保持前端传入的默认业务。
+    """
+    t = (text or "").lower()
+    # WiFi 关键词
+    if any(w in t for w in ["wifi", "wi-fi", "无线网", "热点"]):
+        return "wifi"
+    # 加油关键词
+    if any(w in t for w in ["加油", "油价", "油卡", "汽油", "柴油", "燃油"]):
+        return "refueling"
+    # 流量关键词
+    if any(w in t for w in ["流量", "套餐", "充值", "续费", "基础流量", "流量包"]):
+        return "data"
+    return fallback
+
 def _should_route_live_query(text: str, query_type_code: str) -> bool:
     """区分"怎么查"教程类问题和"帮我查"本人设备数据问题.
 
@@ -902,9 +924,9 @@ def _should_route_live_query(text: str, query_type_code: str) -> bool:
         "操作", "查看方式", "查询方式", "怎么查询", "如何查询",
     ]
     personal_query_markers = [
-        "我的", "我这", "这台", "这辆", "本车", "帮我查", "查一下", "查询一下",
-        "是多少", "多少", "是什么", "到期了吗", "什么时候到期", "到期时间",
-        "在线吗", "离线了吗", "状态", "哪家", "哪个服务商", "谁负责",
+        "我的", "我这", "这台", "这辆", "本车", "帮我查", "帮我查询",
+        "是多少", "什么时候到期", "到期了吗", "到期时间",
+        "在线吗", "离线了吗", "哪家", "哪个服务商",
     ]
 
     if any(marker in t for marker in personal_query_markers):
