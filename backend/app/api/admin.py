@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
 from app.core.database import get_db
-from app.models import Conversation, Message, HandoffTicket, OptimizationSample, EventLog
+from app.models import Conversation, Message, HandoffTicket, OptimizationSample
 from app.schemas.common import BaseResponse, PaginatedResponse
 from app.services.session_service import session_service
 
@@ -58,18 +58,33 @@ async def get_trends(
 async def get_kb_stats(
     db: AsyncSession = Depends(get_db),
 ):
-    """知识库卡片统计数据"""
-    from app.models import FAQCard
-    stmt = select(
-        func.count(FAQCard.id),
-        func.sum(FAQCard.click_count),
-    ).where(FAQCard.is_active == True)
-    result = await db.execute(stmt)
-    total_cards, total_clicks = result.one()
+    """知识库卡片统计数据 (四业务 FAQ 表汇总)."""
+    from app.models import BUSINESS_FAQ_MAP
+
+    total_cards = 0
+    total_clicks = 0
+    by_business = {}
+
+    for business_area, FaqModel in BUSINESS_FAQ_MAP.items():
+        stmt = select(
+            func.count(FaqModel.id),
+            func.sum(FaqModel.click_count),
+        ).where(FaqModel.is_active == True)
+        result = await db.execute(stmt)
+        area_cards, area_clicks = result.one()
+        area_cards = area_cards or 0
+        area_clicks = area_clicks or 0
+        by_business[business_area] = {
+            "cards": area_cards,
+            "clicks": area_clicks,
+        }
+        total_cards += area_cards
+        total_clicks += area_clicks
 
     return BaseResponse(data={
-        "total_cards": total_cards or 0,
-        "total_clicks": total_clicks or 0,
+        "total_cards": total_cards,
+        "total_clicks": total_clicks,
+        "by_business": by_business,
     })
 
 

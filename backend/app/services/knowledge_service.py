@@ -1,6 +1,6 @@
 # 知识库检索服务 (四业务分表版)
 # 按 business_area 路由到对应模型: dashcam/wifi/data/refueling
-# 检索策略: 精确匹配 → 向量检索 → 关键词兜底 → 大模型低置信候选重排
+# 检索策略: 精确匹配 → 向量检索 → 大模型低置信候选重排
 
 import re
 import logging
@@ -54,7 +54,7 @@ class KnowledgeRetrievalService:
         Returns:
             (knowledge_ids, scores, retrieval_method)
         """
-        # L1: 精确匹配 (标准问题完全相等 / 问法变体LIKE)
+        # L1: 精确匹配 (标准问题/问法变体完全相等)
         ids, scores = await self._exact_match(db, query, business_area, top_k)
         if ids and scores and max(scores) >= 0.8:
             return ids, scores, "exact"
@@ -64,30 +64,15 @@ class KnowledgeRetrievalService:
         if self._is_confident_vector(vector_scores):
             return vector_ids[:top_k], vector_scores[:top_k], "vector"
 
-        # L3: 关键词兜底, 补强业务术语/短词/型号类命中
-        kw_ids, kw_scores = await self._keyword_match(db, query, business_area, top_k)
-        # 向量返回空时, 关键词高分往往是"怎么/什么"等通用词噪声 → 不可信
-        if kw_ids and kw_scores and max(kw_scores) >= 0.75 and vector_ids:
-            return kw_ids, kw_scores, "keyword"
-
-        # L4: 低置信候选重排. 只给大模型 topK 候选, 不再传全量知识库。
-        candidates = self._merge_candidates(
-            vector_ids,
-            vector_scores,
-            kw_ids,
-            kw_scores,
-            limit=settings.VECTOR_TOP_K,
-        )
-        if candidates and settings.ENABLE_LLM_RERANK:
-            reranked = await self._llm_rerank(db, query, business_area, [kid for kid, _ in candidates], top_k)
+        # L3: 低置信候选重排. 只给大模型 topK 向量候选, 不再传全量知识库。
+        if vector_ids and settings.ENABLE_LLM_RERANK:
+            reranked = await self._llm_rerank(db, query, business_area, vector_ids, top_k)
             if reranked:
                 return reranked, [0.66 * (0.95 ** i) for i in range(len(reranked))], "llm_rerank"
 
         # 大模型不可用或仍不确定时, 返回可解释的本地候选, 让上游按低置信/连续失败处理。
         if vector_ids and vector_scores and max(vector_scores) >= settings.VECTOR_LOW_SCORE:
             return vector_ids[:top_k], vector_scores[:top_k], "vector_low"
-        if kw_ids and kw_scores:
-            return kw_ids, kw_scores, "keyword"
         return [], [], "none"
 
     async def _vector_match(
@@ -194,14 +179,22 @@ class KnowledgeRetrievalService:
         if exact_rows:
             return [r[0] for r in exact_rows], [float(r[1]) for r in exact_rows]
 
-        # 模糊匹配问法变体
+        rule_ids, rule_scores = await self._dashcam_rule_boost_match(db, query, business_area, top_k)
+        if rule_ids:
+            return rule_ids, rule_scores
+
+        intent_ids, intent_scores = await self._dashcam_query_method_match(db, query, business_area, top_k)
+        if intent_ids:
+            return intent_ids, intent_scores
+
+        # 精确匹配问法变体, 避免 LIKE 把短问句扩散到多个相近知识条目。
         variant_stmt = (
             select(var.knowledge_id, literal(0.85).label("score"))
             .join(kn, var.knowledge_id == kn.id)
             .where(
                 and_(
                     kn.status == "published",
-                    var.variant_text.like(f"%{query}%"),
+                    var.variant_text == query,
                     var.is_active == True,
                 )
             )
@@ -209,7 +202,64 @@ class KnowledgeRetrievalService:
         )
         variant_result = await db.execute(variant_stmt)
         variant_rows = variant_result.all()
+        if len(variant_rows) > 1:
+            return [], []
         return [r[0] for r in variant_rows], [float(r[1]) for r in variant_rows]
+
+    async def _dashcam_rule_boost_match(
+        self, db: AsyncSession, query: str, business_area: str, top_k: int
+    ) -> Tuple[List[int], List[float]]:
+        """Narrow deterministic boosts for high-frequency dashcam tutorial intents."""
+        if business_area != "dashcam":
+            return [], []
+
+        q = (query or "").lower()
+        if not q:
+            return [], []
+
+        kn, var, kw, att, faq, cat_attr = self._get_models(business_area)
+
+        if re.search(r"(续费|续约|到期|过期)", q) and re.search(r"(怎么|如何|怎样|处理|怎么办|续|开通)", q):
+            stmt = (
+                select(kn.id, literal(0.92).label("score"))
+                .where(
+                    and_(
+                        kn.status == "published",
+                        or_(kn.category_l2.like("%续费%"), kn.standard_question.like("%续费%")),
+                    )
+                )
+                .limit(top_k)
+            )
+            result = await db.execute(stmt)
+            rows = result.all()
+            return [r[0] for r in rows], [float(r[1]) for r in rows]
+
+        return [], []
+
+    async def _dashcam_query_method_match(
+        self, db: AsyncSession, query: str, business_area: str, top_k: int
+    ) -> Tuple[List[int], List[float]]:
+        """Narrow exact boost for dashcam "how to query SIM/terminal" questions."""
+        if business_area != "dashcam":
+            return [], []
+
+        q = (query or "").lower()
+        if re.search(r"(拔插|插拔|安装|更换|取出|拆|插.*哪|插入|插卡|卡槽)", q):
+            return [], []
+        has_instruction = re.search(r"(怎么|如何|怎样|哪里|在哪|查询|查看)", q)
+        has_identifier = re.search(r"(sim|卡号|iccid|终端号|终端编号|设备号|设备编号|设备id|device.?id)", q)
+        if not (has_instruction and has_identifier):
+            return [], []
+
+        kn, var, kw, att, faq, cat_attr = self._get_models(business_area)
+        stmt = (
+            select(kn.id, literal(0.9).label("score"))
+            .where(and_(kn.status == "published", kn.category_l2 == "查询SIM/ID方法"))
+            .limit(top_k)
+        )
+        result = await db.execute(stmt)
+        rows = result.all()
+        return [r[0] for r in rows], [float(r[1]) for r in rows]
 
     async def _keyword_match(
         self, db: AsyncSession, query: str, business_area: str, top_k: int

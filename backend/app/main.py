@@ -12,6 +12,7 @@ from app.core.database import init_db, close_db
 from app.core.redis_client import close_redis
 from app.api import chat, knowledge, evaluation, admin
 from app.services.embedding_service import embedding_service
+from app.services.rule_service import load_keyword_rules, seed_default_keyword_rules
 
 # 日志配置
 logging.basicConfig(
@@ -32,6 +33,8 @@ async def lifespan(app: FastAPI):
     try:
         await init_db()
         logger.info("✅ 数据库初始化完成")
+        seeded_rules, loaded_rules = await _load_keyword_rules()
+        logger.info("✅ 规则关键词加载完成: %s 条, 新增默认规则 %s 条", loaded_rules, seeded_rules)
         loaded = await _load_embeddings()
         logger.info("✅ 知识向量缓存加载完成: %s 条", loaded)
     except Exception as e:
@@ -92,6 +95,23 @@ async def _load_embeddings() -> int:
     except Exception as e:
         logger.warning("知识向量缓存加载失败, 将跳过向量检索: %s", e)
         return 0
+
+
+async def _load_keyword_rules() -> tuple[int, int]:
+    """启动时补齐并加载 keyword_rule; 加载失败时使用代码默认规则."""
+    try:
+        from app.core.database import get_session_factory
+
+        factory = get_session_factory()
+        async with factory() as db:
+            seeded = await seed_default_keyword_rules(db)
+            if seeded:
+                await db.commit()
+            loaded = await load_keyword_rules(db)
+        return seeded, loaded
+    except Exception as e:
+        logger.warning("规则关键词加载失败, 将使用代码默认规则: %s", e)
+        return 0, 0
 
 
 # ============================================

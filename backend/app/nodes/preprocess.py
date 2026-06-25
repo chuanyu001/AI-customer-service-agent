@@ -1,20 +1,13 @@
 # 节点1: 消息预处理
 # 清洗输入、识别消息类型、上下文继承
 
-import re
 from ..graph.state import WorkflowState
-
-
-# 转人工关键词
-TRANSFER_KEYWORDS = [
-    "转人工", "人工客服", "人工服务", "找人工", "真人",
-    "转接", "人工电话", "我要找客服", "人工", "客服",
-]
-
-# 问候语
-GREETING_PATTERNS = [
-    r"^(你好|您好|hi|hello|在吗|在不在|嗨|早上好|下午好|晚上好)",
-]
+from ..services.rule_service import (
+    TRANSFER_KEYWORDS,
+    normalize_text,
+    is_greeting,
+    is_transfer_request,
+)
 
 
 async def preprocess_node(state: WorkflowState) -> WorkflowState:
@@ -67,35 +60,14 @@ async def preprocess_node(state: WorkflowState) -> WorkflowState:
 
 def _clean_query(text: str) -> str:
     """清洗用户输入"""
-    if not text:
-        return ""
-
-    # 去首尾空白
-    text = text.strip()
-
-    # 统一换行
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-
-    # 统一省略号
-    text = text.replace("…", "...").replace("。。", "。")
-
-    # 去除多余空格
-    text = re.sub(r"\s+", " ", text)
-
-    return text
+    return normalize_text(text)
 
 
 def check_transfer_keyword(text: str) -> bool:
     """检测是否包含转人工关键词"""
-    for kw in TRANSFER_KEYWORDS:
-        if kw in text:
-            return True
-    return False
+    return is_transfer_request(text)
 
 
 def check_greeting(text: str) -> bool:
     """检测是否为问候语"""
-    for pattern in GREETING_PATTERNS:
-        if re.match(pattern, text):
-            return True
-    return False
+    return is_greeting(text)

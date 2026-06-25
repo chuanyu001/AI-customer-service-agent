@@ -1,6 +1,6 @@
 # 运营平台数据对接
 # 通过 batchVehicleInfo 接口实时查询设备信息 (仅支持 VIN 查询)
-# 返回字段已对齐 OperationalDevice 模型字段名, 下游 field_dictionary 映射/过滤可零改动复用
+# 返回字段尽量对齐 operational_data / field_dictionary 字段名, 下游可统一映射/过滤
 
 import logging
 from typing import Optional, Dict, Any, List
@@ -11,7 +11,7 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# 接口原始字段 → OperationalDevice 字段名 (便于复用 field_dictionary 映射)
+# 接口原始字段 → 本地运营字段名 (便于复用 field_dictionary 映射)
 # 注意: 品牌字段(brand)目前接口尚未返回, 预留映射, 待接口提供后自动生效
 _FIELD_MAP = {
     "vin": "vin",

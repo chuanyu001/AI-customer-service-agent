@@ -25,10 +25,9 @@ async def query_judgment_node(state: WorkflowState) -> WorkflowState:
     state["slots_collected"] = False
     state["required_slots"] = []
 
-    # 如果意图不是 live_query, 且知识检索有结果, 直接跳过
+    # 只有意图识别已判定为 live_query 时才进入槽位收集。
     intent_type = state.get("intent_type", "unknown")
-    matched_ids = state.get("matched_knowledge_ids", [])
-    if intent_type != "live_query" and matched_ids:
+    if intent_type != "live_query":
         return state
 
     state["is_live_query"] = True
@@ -37,7 +36,9 @@ async def query_judgment_node(state: WorkflowState) -> WorkflowState:
     # Step 1: 尝试匹配查询类型
     # ============================================
     # 从查询意图关键词推断
-    query_type_code = _match_query_type(query)
+    from app.services.rule_service import match_query_type
+
+    query_type_code = state.get("query_type_code") or match_query_type(query)
 
     if not query_type_code:
         # 无法匹配查询类型 → 不视为查询意图
@@ -100,8 +101,7 @@ async def query_judgment_with_db(state: WorkflowState, db) -> WorkflowState:
     state["required_slots"] = []
 
     intent_type = state.get("intent_type", "unknown")
-    matched_ids = state.get("matched_knowledge_ids", [])
-    if intent_type != "live_query" and matched_ids:
+    if intent_type != "live_query":
         return state
 
     state["is_live_query"] = True
@@ -110,7 +110,9 @@ async def query_judgment_with_db(state: WorkflowState, db) -> WorkflowState:
     from app.models import QueryIntentConfig
     from sqlalchemy import select
 
-    query_type_code = _match_query_type(query)
+    from app.services.rule_service import match_query_type
+
+    query_type_code = state.get("query_type_code") or match_query_type(query)
     if not query_type_code:
         state["is_live_query"] = False
         return state
@@ -175,7 +177,7 @@ def _match_query_type(query: str) -> Optional[str]:
     # 查询意图关键词映射 (来自Excel 02_查询问题库)
     intent_patterns = [
         (r"(sim|卡号|iccid)", "QRY001"),       # query_sim_no
-        (r"(终端号|设备id|device.?id)", "QRY002"),  # query_device_id
+        (r"(终端号|设备号|设备id|device.?id)", "QRY002"),  # query_device_id
         (r"(sim.*终端|终端.*sim|卡号.*终端|id.*sim)", "QRY003"),  # query_sim_and_id
         (r"(服务商|运营商)", "QRY004"),          # query_service_provider
         (r"(司机卡|驾驶员卡|ic卡)", "QRY005"),   # query_driver_card_provider

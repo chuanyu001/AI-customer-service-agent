@@ -1,12 +1,12 @@
 # 品牌识别服务
-# 4级优先级链: 精确查表 → 格式规则 → MCU验证 → 人工兜底
+# 优先级链: 精确查表 → 格式规则 → operational_data/终端号规则 → 人工兜底
 
 import re
 from typing import Dict, Optional, List
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.models import BrandInfo, BrandMapping, OperationalDevice, YouweiDevice, OperationalData
+from app.models import BrandInfo, BrandMapping, YouweiDevice, OperationalData
 
 
 @dataclass
@@ -16,18 +16,18 @@ class BrandResult:
     brand_name: Optional[str] = None
     brand_code: Optional[str] = None
     confidence: float = 0.0
-    path: str = "unknown"               # exact_lookup/format_rule/mcu_verify/human_fallback
+    path: str = "unknown"               # exact_lookup/format_rule/operational_data/human_fallback
     matched_rule: Optional[str] = None
     prompt: Optional[str] = None        # 识别失败时的引导语
 
 
 class BrandIdentificationService:
-    """品牌识别服务 — 4级优先级链
+    """品牌识别服务
 
     优先级:
     1. 精确查表 (brand_mapping): VIN前缀/终端号前缀/设备型号 → 置信度 ≥ 0.95
     2. 格式规则匹配 (brand_info.id_format_rules): 正则表达式 → 置信度 ≥ 0.80
-    3. MCU验证 (operational_device.mcu_version): → 置信度 ≥ 0.60
+    3. operational_data + 终端号规则: VIN 查品牌/终端号, 再结合 youwei_device 二次识别
     4. 人工兜底: 引导用户提供更多信息或转人工
     """
 
@@ -74,12 +74,7 @@ class BrandIdentificationService:
         if result.confidence >= 0.80:
             return result
 
-        # Level 3: MCU验证
-        result = await self._mcu_verification(db, user_input, collected_info)
-        if result.confidence >= 0.60:
-            return result
-
-        # Level 4: 人工兜底
+        # Level 3: 人工兜底
         return BrandResult(
             confidence=0.0,
             path="human_fallback",
@@ -88,8 +83,16 @@ class BrandIdentificationService:
 
     async def identify_by_keyword(self, user_input: str) -> Optional[BrandResult]:
         """从用户输入文本中提取品牌关键词 (快速通道)"""
-        for keyword, brand_name in self.BRAND_KEYWORDS.items():
+        for keyword, brand_name in sorted(self.BRAND_KEYWORDS.items(), key=lambda item: len(item[0]), reverse=True):
             if keyword in user_input:
+                if keyword == "鱼快":
+                    return BrandResult(
+                        brand_name=None,
+                        confidence=0.6,
+                        path="keyword_ambiguous",
+                        matched_rule="用户输入包含鱼快, 需结合VIN/终端号区分极目/有为",
+                        prompt="鱼快设备需结合车架号(VIN)或终端号确认具体厂家。",
+                    )
                 return BrandResult(
                     brand_name=brand_name,
                     confidence=0.85,
@@ -340,41 +343,6 @@ class BrandIdentificationService:
                     path="format_rule",
                     matched_rule=f"VIN匹配规则: {vin_pattern}",
                 )
-
-        return BrandResult(confidence=0.0)
-
-    async def _mcu_verification(
-        self, db: AsyncSession, user_input: str, collected_info: Dict
-    ) -> BrandResult:
-        """Level 3: 通过 operational_device 中的 MCU版本验证"""
-        identifiers = self._extract_identifiers(user_input, collected_info)
-
-        for ident_type, ident_value in identifiers:
-            if not ident_value or ident_type not in ("vin", "terminal_id"):
-                continue
-
-            # 查询运营平台
-            field = "vin" if ident_type == "vin" else "terminal_id"
-            stmt = select(OperationalDevice).where(
-                getattr(OperationalDevice, field) == ident_value
-            ).limit(1)
-
-            result = await db.execute(stmt)
-            device = result.scalar_one_or_none()
-
-            if device and device.brand_id:
-                brand_stmt = select(BrandInfo).where(BrandInfo.id == device.brand_id)
-                brand_result = await db.execute(brand_stmt)
-                brand = brand_result.scalar_one_or_none()
-                if brand:
-                    return BrandResult(
-                        brand_id=brand.id,
-                        brand_name=brand.brand_name,
-                        brand_code=brand.brand_code,
-                        confidence=0.65,
-                        path="mcu_verify",
-                        matched_rule=f"运营平台匹配: {field}={ident_value}",
-                    )
 
         return BrandResult(confidence=0.0)
 

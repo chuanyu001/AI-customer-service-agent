@@ -1,10 +1,9 @@
 # 业务数据 ORM 模型
-# 业务事实数据表组: brand_info, brand_mapping, field_dictionary, operational_device, device_vehicle_relation
+# 业务事实数据表组: brand_info, brand_mapping, field_dictionary, device_vehicle_relation, youwei_device, operational_data
 
 from sqlalchemy import (
-    Column, String, Text, Integer, BigInteger, Boolean, DateTime, JSON, ForeignKey, Float
+    Column, String, Text, Integer, BigInteger, Boolean, DateTime, JSON, ForeignKey
 )
-from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.core.database import Base
 
@@ -21,7 +20,6 @@ class BrandInfo(Base):
     business_area = Column(String(32), default="dashcam", index=True, comment="业务领域")
     priority = Column(Integer, default=0, index=True, comment="识别优先级 (1-7)")
     id_format_rules = Column(JSON, comment="ID格式正则规则")
-    mcu_verify_rule = Column(String(256), comment="MCU验证规则")
     contact_phone = Column(String(32), comment="厂家电话")
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -52,30 +50,6 @@ class FieldDictionary(Base):
     can_show_customer = Column(Boolean, default=False, comment="是否可展示给客户")
     description = Column(String(256), comment="使用说明")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-
-
-class OperationalDevice(Base):
-    """运营平台设备数据表 (360k行)"""
-    __tablename__ = "operational_device"
-
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
-    business_area = Column(String(32), default="dashcam", index=True, comment="业务领域")
-    vin = Column(String(32), index=True, comment="车架号")
-    plate_number = Column(String(16), index=True, comment="车牌号")
-    terminal_id = Column(String(64), index=True, comment="终端号")
-    sim_iccid = Column(String(32), index=True, comment="SIM卡ICCID")
-    brand_id = Column(Integer, index=True, comment="品牌ID")
-    device_model = Column(String(64), comment="设备型号")
-    online_status = Column(String(16), comment="在线状态")
-    gps_status = Column(String(16), comment="定位状态")
-    service_provider = Column(String(128), comment="服务商")
-    service_expiry = Column(DateTime(timezone=True), comment="服务到期日")
-    firmware_version = Column(String(32), comment="固件版本")
-    mcu_version = Column(String(32), comment="MCU版本")
-    last_online_time = Column(DateTime(timezone=True), comment="最后在线时间")
-    extra_metadata = Column("metadata", JSON, comment="扩展字段")
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
 class DeviceVehicleRelation(Base):

@@ -27,9 +27,14 @@ from app.services.brand_service import BrandIdentificationService
 brand_service = BrandIdentificationService()
 from app.graph.workflow import agent_workflow
 from app.graph.state import WorkflowState
-from app.nodes.preprocess import check_transfer_keyword, check_greeting
-from app.nodes.intent_recognition import INTENT_LABELS
-from app.nodes.human_transfer import HIGH_RISK_KEYWORDS, UNSUPPORTED_OPERATIONS
+from app.services.rule_service import (
+    classify_intent,
+    detect_business_area,
+    evaluate_transfer,
+    is_greeting,
+    needs_clarify,
+    should_route_live_query,
+)
 
 router = APIRouter(prefix="/chat", tags=["Chat"])
 
@@ -149,6 +154,8 @@ async def send_message(
     )
     await db.commit()
 
+    effective_business = detect_business_area(req.content, req.business_area)
+
     # ============================================
     # Step 2: 构建初始 WorkflowState
     # ============================================
@@ -156,7 +163,7 @@ async def send_message(
         "query": req.content,
         "session_id": session_id,
         "user_id": req.user_id or "",
-        "business_area": req.business_area,
+        "business_area": effective_business,
         "channel": "miniprogram",
         "entry_point": req.entry_point or "",
         "message_type": req.content_type,
@@ -409,24 +416,11 @@ async def send_message(
     # ============================================
     # Step 3: 快速通道 — 转人工/高风险/超出范围/问候语
     # ============================================
-    # 高风险词 (投诉/退款/12315...) 或超出AI范围操作 (修改绑定/激活...) → 直接转人工
-    needs_transfer = (
-        check_transfer_keyword(req.content)
-        or any(kw in req.content for kw in HIGH_RISK_KEYWORDS)
-        or any(op in req.content for op in UNSUPPORTED_OPERATIONS)
-    )
+    # 显式转人工、高风险投诉、超权限操作 → 直接转人工。
+    transfer_decision = evaluate_transfer(req.content, effective_business)
+    needs_transfer = transfer_decision.should_transfer
 
     if needs_transfer:
-        # 判断转人工原因
-        if check_transfer_keyword(req.content):
-            reason_type, reason = "user_request", "用户要求转人工"
-        elif any(kw in req.content for kw in HIGH_RISK_KEYWORDS):
-            hit = next(kw for kw in HIGH_RISK_KEYWORDS if kw in req.content)
-            reason_type, reason = "risk", f"检测到高风险关键词: {hit}"
-        else:
-            hit = next(op for op in UNSUPPORTED_OPERATIONS if op in req.content)
-            reason_type, reason = "out_of_scope", f"超出AI服务范围: {hit}"
-
         await session_service.update_session_status(
             db, session_id, "transferred",
             transfer_count=(conv.transfer_count or 0) + 1,
@@ -435,13 +429,13 @@ async def send_message(
         await session_service.create_handoff_ticket(
             db=db,
             session_id=session_id,
-            reason_type=reason_type,
-            reason_detail=reason,
-            priority="high" if reason_type == "risk" else "normal",
+            reason_type=transfer_decision.reason_type,
+            reason_detail=transfer_decision.reason,
+            priority=transfer_decision.priority,
         )
         await db.commit()
 
-        transfer_msg = f"检测到您的问题需要人工处理（{reason}），正在为您转接人工客服，请稍候..."
+        transfer_msg = f"检测到您的问题需要人工处理（{transfer_decision.reason}），正在为您转接人工客服，请稍候..."
         ai_msg = await session_service.add_message(
             db=db,
             conversation_id=conv.id,
@@ -464,8 +458,8 @@ async def send_message(
             ).model_dump()
         )
 
-    if check_greeting(req.content):
-        faq_cards = await knowledge_service.get_faq_cards(db, req.business_area)
+    if is_greeting(req.content):
+        faq_cards = await knowledge_service.get_faq_cards(db, effective_business)
         follow_ups = [c.title for c in faq_cards[:5]]
 
         ai_msg = await session_service.add_message(
@@ -496,7 +490,7 @@ async def send_message(
     # 用户直接发VIN (如 LFNAHUPMXT1E19383) 时, 不依赖pending上下文,
     # 主动通过VIN查询品牌, 即使会话变了也能工作
     # 仅拦截"纯VIN"消息, 避免误拦截含VIN的完整查询 (如"查设备 LFNAHUPMXT1E19383"应走live_query)
-    if req.business_area == "dashcam" and not pending:
+    if effective_business == "dashcam" and not pending:
         vin = _extract_vin(req.content)
         if vin:
             stripped = req.content.strip().upper()
@@ -542,20 +536,12 @@ async def send_message(
     # ============================================
     # Step 4: 运行简化版工作流 (不使用LangGraph runtime, 直接调用)
     # ============================================
-    # 自动业务路由: 根据消息关键词推断业务域
-    effective_business = _detect_business_area(req.content, req.business_area)
-
     # 4.1 规则优先意图识别: 正常主路径不再调用大模型分类
-    from app.nodes.query_judgment import _match_query_type
-
-    qtype = _match_query_type(req.content)
-    # 仅行车记录仪业务支持运营平台实时查询, WiFi/流量/加油是纯知识问答
-    if effective_business == "dashcam" and qtype and _should_route_live_query(req.content, qtype):
-        intent_type = "live_query"
-        intent_confidence = 0.9
-    else:
-        intent_type = "knowledge_query"
-        intent_confidence = 0.75
+    intent_decision = classify_intent(req.content, req.business_area)
+    effective_business = intent_decision.business_area
+    qtype = intent_decision.query_type_code
+    intent_type = intent_decision.intent_type
+    intent_confidence = intent_decision.confidence
 
     logger.info(f"[意图识别] query='{req.content}' -> intent={intent_type} conf={intent_confidence:.2f}")
 
@@ -579,7 +565,7 @@ async def send_message(
 
         if matched_ids and matched_scores and max(matched_scores) >= 0.4:
             # 查询太短或意图模糊时, 先追问澄清再答
-            if _needs_clarify(req.content, matched_scores, method):
+            if needs_clarify(req.content, matched_scores, method):
                 clarify_msg = await _build_clarify_prompt(db, req.content, effective_business)
                 ai_msg = await session_service.add_message(
                     db=db, conversation_id=conv.id, role="assistant",
@@ -600,7 +586,7 @@ async def send_message(
                 # 高风险知识条目不直接对客, 进入人工处理
                 if getattr(best, "risk_level", "low") == "high":
                     reason = f"命中高风险知识: {best.knowledge_code}"
-                    await session_service.update_conversation_status(
+                    await session_service.update_session_status(
                         db, session_id, "transferred",
                         transfer_count=(conv.transfer_count or 0) + 1,
                     )
@@ -656,7 +642,7 @@ async def send_message(
                         "type": "transfer_collection",
                         "knowledge_id": best.id,
                         "knowledge_code": best.knowledge_code,
-                        "business_area": req.business_area,
+                        "business_area": effective_business,
                         "query": req.content,
                     })
                     await db.commit()
@@ -911,86 +897,25 @@ def _extract_vin(text: str) -> Optional[str]:
 
 
 def _needs_clarify(query: str, scores: list, method: str) -> bool:
-    """判断查询是否太模糊, 需要追问澄清.
-
-    仅在用户只扔了几个关键词、没有完整问题句时触发。
-    有疑问代词(怎么/如何/什么/为什么)的完整问题直接放过。
-    """
-    q = query.strip()
-    # 含疑问词 → 用户已经表达了完整问题
-    if any(w in q for w in ["怎么", "如何", "什么", "为什么", "哪", "吗", "呢"]):
-        return False
-    # 极短 (< 5字) 且不含具体对象 → 太模糊
-    if len(q) < 5:
-        return True
-    # 候选分数太接近 → 意图不明确
-    if len(scores) >= 2 and (scores[0] - scores[1]) < 0.05:
-        return True
-    return False
+    """兼容旧测试入口, 实际逻辑在 rule_service.needs_clarify."""
+    return needs_clarify(query, scores, method)
 
 def _detect_business_area(text: str, fallback: str) -> str:
-    """根据消息内容自动推断业务域，减少用户切业务的成本。
-
-    流量/WiFi/加油有明确关键词，命中直接路由。
-    其他情况保持前端传入的默认业务。
-    """
-    t = (text or "").lower()
-    # WiFi 关键词
-    if any(w in t for w in ["wifi", "wi-fi", "无线网", "热点"]):
-        return "wifi"
-    # 加油关键词
-    if any(w in t for w in ["加油", "油价", "油卡", "汽油", "柴油", "燃油"]):
-        return "refueling"
-    # 流量关键词
-    if any(w in t for w in ["流量", "套餐", "充值", "续费", "基础流量", "流量包"]):
-        return "data"
-    return fallback
+    """兼容旧测试入口, 实际逻辑在 rule_service.detect_business_area."""
+    return detect_business_area(text, fallback)
 
 def _should_route_live_query(text: str, query_type_code: str) -> bool:
-    """区分"怎么查"教程类问题和"帮我查"本人设备数据问题.
-
-    query_judgment 的关键词能识别 13 类查询类型, 但像"怎么查询SIM卡号"
-    应走知识库教程, 而不是要求用户提供 VIN。只有用户明显在查自己设备
-    的事实数据时才进入运营平台查询分支。
-    """
-    if _extract_vin(text):
-        return True
-
-    t = (text or "").lower()
-    instructional_markers = [
-        "怎么", "如何", "怎样", "在哪", "哪里", "方法", "步骤", "教程",
-        "操作", "查看方式", "查询方式", "怎么查询", "如何查询",
-    ]
-    personal_query_markers = [
-        "我的", "我这", "这台", "这辆", "本车", "帮我查", "帮我查询",
-        "是多少", "什么时候到期", "到期了吗", "到期时间",
-        "在线吗", "离线了吗", "哪家", "哪个服务商",
-    ]
-
-    if any(marker in t for marker in personal_query_markers):
-        return True
-
-    if any(marker in t for marker in instructional_markers):
-        return False
-
-    # 缴费/激活/开通类容易涉及业务操作, 没有个人设备标识时先交给知识库解释流程。
-    if query_type_code == "QRY009":
-        return False
-
-    return False
+    """兼容旧测试入口, 实际逻辑在 rule_service.should_route_live_query."""
+    return should_route_live_query(text, query_type_code)
 
 
 async def _build_clarify_prompt(db, query: str, business_area: str) -> str:
     """意图不明时, 从低置信候选生成追问, 引导用户澄清需求."""
     try:
-        from app.services.knowledge_service import knowledge_service
         from app.models import BUSINESS_KNOWLEDGE_MAP
         from sqlalchemy import select
 
-        # 用关键词检索找可能的候选
-        kw_ids, kw_scores = await knowledge_service._keyword_match(db, query, business_area, top_k=3)
-
-        # 取向量检索兜底
+        # 取低置信向量候选生成澄清问题; 不再使用知识关键词表做候选。
         try:
             from app.services.embedding_service import embedding_service
             vec_results = await embedding_service.search(query, business_area=business_area, top_k=3)
@@ -998,8 +923,7 @@ async def _build_clarify_prompt(db, query: str, business_area: str) -> str:
         except Exception:
             vec_ids = []
 
-        # 合并去重
-        all_ids = list(dict.fromkeys(list(kw_ids) + vec_ids))[:3]
+        all_ids = list(dict.fromkeys(vec_ids))[:3]
         if not all_ids:
             return ("抱歉，我没有完全理解您的问题。您能再具体描述一下吗？\n"
                     "比如告诉我您遇到的问题是什么、涉及到什么设备或服务。\n"

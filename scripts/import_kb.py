@@ -247,7 +247,6 @@ class KnowledgeBaseImporter:
                     priority = 99
 
                 rule_text = self._safe_str(row.get("主判断规则", ""))
-                secondary_rule = self._safe_str(row.get("二次判断/数据源", ""))
                 auto_condition = self._safe_str(row.get("自动识别条件", ""))
 
                 brand = BrandInfo(
@@ -258,7 +257,6 @@ class KnowledgeBaseImporter:
                     business_area="dashcam",
                     priority=priority,
                     id_format_rules=self._parse_format_rules(rule_text),
-                    mcu_verify_rule=secondary_rule if secondary_rule else None,
                     is_active=True,
                 )
                 db.add(brand)

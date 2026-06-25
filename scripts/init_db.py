@@ -10,16 +10,19 @@ import asyncio
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 
 from app.core.config import settings
-from app.core.database import Base, get_engine, close_db
+from app.core.database import Base, get_engine, close_db, get_session_factory
 from app.models import *  # noqa: F401,F403 — 确保所有模型被注册
+from app.services.rule_service import load_keyword_rules, seed_default_keyword_rules
 
 
 async def init_database():
     """创建所有数据库表"""
     print("正在创建所有数据库表...")
     await init_db_schema()
+    inserted, loaded = await init_keyword_rules()
     await close_db()
     print("[OK] 数据库表创建完成!")
+    print(f"[OK] keyword_rule 默认规则: 新增 {inserted} 条, 已加载 {loaded} 条")
 
 
 async def init_db_schema():
@@ -27,6 +30,17 @@ async def init_db_schema():
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+
+async def init_keyword_rules():
+    """补齐 keyword_rule 默认数据, 已存在的规则不覆盖"""
+    factory = get_session_factory()
+    async with factory() as db:
+        inserted = await seed_default_keyword_rules(db)
+        if inserted:
+            await db.commit()
+        loaded = await load_keyword_rules(db)
+    return inserted, loaded
 
 
 async def drop_all_tables():

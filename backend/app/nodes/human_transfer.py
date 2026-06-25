@@ -2,25 +2,12 @@
 # 5种转人工触发条件 + 对话摘要 + 工单生成
 
 from datetime import datetime
-from typing import Optional
 from ..graph.state import WorkflowState
-from ..services.llm_service import get_llm
-
-
-# 高风险关键词
-HIGH_RISK_KEYWORDS = [
-    "投诉", "退款", "315", "12315", "起诉", "媒体曝光",
-    "曝光", "维权", "消协", "工商", "赔偿", "欺诈", "骗人",
-]
-
-# 超出AI范围的操作
-UNSUPPORTED_OPERATIONS = [
-    "审核", "转网", "入网审核", "开通审核",
-    "写车架号", "下发车架号", "车辆信息写入",
-    "修改车辆资料", "修改设备资料",
-    "修改绑定", "换绑", "解绑",
-    "激活设备", "修改套餐", "修改缴费记录",
-]
+from ..services.rule_service import (
+    HIGH_RISK_KEYWORDS,
+    UNSUPPORTED_OPERATIONS,
+    evaluate_transfer,
+)
 
 
 async def human_transfer_node(state: WorkflowState) -> WorkflowState:
@@ -109,24 +96,20 @@ def _evaluate_transfer(state: WorkflowState) -> tuple:
     """评估是否需要转人工 → (should_transfer, reason_type, reason)"""
     query = state.get("query", "")
     consecutive_fail = state.get("consecutive_fail_count", 0)
+    business_area = state.get("business_area", "dashcam")
 
     # Rule 1: 连续失败
     if consecutive_fail >= 3:
         return True, "consecutive_fail", f"连续{consecutive_fail}轮未能解决用户问题"
 
-    # Rule 2: 高风险关键词
-    for kw in HIGH_RISK_KEYWORDS:
-        if kw in query:
-            return True, "risk", f"检测到高风险关键词: {kw}"
+    # Rule 2-4: 统一规则服务判断显式转人工、高风险、超权限操作
+    decision = evaluate_transfer(query, business_area)
+    if decision.should_transfer:
+        return True, decision.reason_type, decision.reason
 
     # Rule 3: 用户请求 (由 intent_recognition 处理)
     if state.get("intent_type") == "transfer_request":
         return True, "user_request", "用户明确要求转人工"
-
-    # Rule 4: 超出范围操作
-    for op in UNSUPPORTED_OPERATIONS:
-        if op in query:
-            return True, "out_of_scope", f"用户请求超出AI服务范围: {op}"
 
     # Rule 5: 命中需人工处理的知识 (非对客类知识, 由 chat.py 设 transfer_due_to_kb 标记)
     if state.get("transfer_due_to_kb"):

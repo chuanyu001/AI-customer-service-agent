@@ -1,7 +1,6 @@
 # 节点3: 知识库检索
-# 三层检索 + 品牌感知 + 品牌降级
+# 知识库检索 + 品牌感知 + 品牌降级
 
-from typing import List, Optional
 from ..graph.state import WorkflowState
 from ..services.knowledge_service import knowledge_service
 from ..services.brand_service import BrandIdentificationService
@@ -15,7 +14,7 @@ async def knowledge_retrieval_node(state: WorkflowState) -> WorkflowState:
     处理流程:
     1. 获取改写后的问题
     2. 尝试品牌识别 (从用户输入 + 已收集信息)
-    3. 三层检索 (L1精确 → L2关键词 → L3向量)
+    3. 检索 (L1精确 → L2向量 → 低置信重排)
     4. 品牌降级: 该品牌无知识 → 降级到通用知识
     """
     query = state.get("rewritten_query", state.get("query", ""))
@@ -36,11 +35,19 @@ async def knowledge_retrieval_node(state: WorkflowState) -> WorkflowState:
             # 存储品牌信息到 collected_slots
             state["collected_slots"]["brand"] = brand_name
 
+    db = state.get("db") or state.get("_db")
+    if db is None:
+        state["matched_knowledge_ids"] = []
+        state["matched_knowledge_scores"] = []
+        state["knowledge_retrieval_method"] = "missing_db"
+        state["error"] = "knowledge_retrieval_node requires db; use knowledge_retrieval_with_db when reconnecting LangGraph"
+        return state
+
     # ============================================
-    # Step 2: 三层检索 (品牌逻辑已在chat.py处理)
+    # Step 2: 知识检索 (品牌逻辑已在chat.py处理)
     # ============================================
     matched_ids, matched_scores, method = await knowledge_service.retrieve(
-        db=None,  # 由调用方注入, 这里从state获取
+        db=db,
         query=query,
         business_area=business_area,
         top_k=5,

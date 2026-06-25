@@ -1,10 +1,9 @@
 # 节点2: 意图识别 + 问题改写
 # LLM分类 + 关键词快速通道 + 多轮问题改写
 
-import json
 from ..graph.state import WorkflowState
-from ..services.llm_service import get_llm
 from ..nodes.preprocess import check_transfer_keyword, check_greeting
+from ..services.rule_service import classify_intent
 
 
 # 意图标签
@@ -35,10 +34,9 @@ async def intent_recognition_node(state: WorkflowState) -> WorkflowState:
     3. 问题改写 (多轮上下文补全)
     """
     query = state.get("cleaned_query", state.get("query", ""))
-    llm = get_llm()
 
     # ============================================
-    # Step 1: 关键词快速通道 (不调用LLM)
+    # Step 1: 规则快速通道 (不调用LLM)
     # ============================================
 
     # 转人工关键词检测
@@ -55,47 +53,17 @@ async def intent_recognition_node(state: WorkflowState) -> WorkflowState:
         state["rewritten_query"] = query
         return state
 
-    # ============================================
-    # Step 2: LLM意图分类
-    # ============================================
-
-    # 构建历史上下文
-    messages = state.get("messages", [])
-    history_text = _build_history_context(messages, max_turns=3)
-
-    try:
-        result = await llm.classify(
-            text=query,
-            labels=INTENT_LABELS,
-            context=history_text,
-        )
-        intent_type = result.get("label", "unknown")
-        confidence = result.get("confidence", 0.0)
-    except Exception as e:
-        # LLM调用失败 → 降级为 unknown
-        intent_type = "unknown"
-        confidence = 0.0
-        state["error"] = f"意图识别LLM调用失败: {e}"
-
-    state["intent_type"] = intent_type
-    state["intent_confidence"] = confidence
+    decision = classify_intent(query, state.get("business_area", "dashcam"))
+    state["business_area"] = decision.business_area
+    state["intent_type"] = decision.intent_type
+    state["intent_confidence"] = decision.confidence
+    state["query_type_code"] = decision.query_type_code
+    state["intent_method"] = decision.method
 
     # ============================================
-    # Step 3: 问题改写 (多轮上下文补全)
+    # Step 2: 问题改写 (保留钩子, 但正常主路径不调用LLM)
     # ============================================
-
-    if history_text and intent_type in ("knowledge_query", "live_query", "unknown"):
-        try:
-            history_lines = _extract_history_lines(messages, max_turns=3)
-            rewritten = await llm.rewrite(query, history_lines)
-            if rewritten and rewritten != query:
-                state["rewritten_query"] = rewritten
-            else:
-                state["rewritten_query"] = query
-        except Exception:
-            state["rewritten_query"] = query
-    else:
-        state["rewritten_query"] = query
+    state["rewritten_query"] = query
 
     return state
 

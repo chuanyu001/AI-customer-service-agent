@@ -32,13 +32,13 @@ from .business import (
     BrandInfo,
     BrandMapping,
     FieldDictionary,
-    OperationalDevice,
     DeviceVehicleRelation,
     YouweiDevice,
     OperationalData,
 )
 from .system import SystemConfig, DataDictionary, EventLog
 from .embedding import KnowledgeEmbedding
+from .rules import KeywordRule
 
 
 # 业务 → 知识主表模型 的路由映射 (检索/CRUD按此路由)
@@ -97,9 +97,11 @@ __all__ = [
     # 会话
     "Conversation", "Message", "AnswerFeedback", "HandoffTicket", "OptimizationSample",
     # 业务
-    "BrandInfo", "BrandMapping", "FieldDictionary", "OperationalDevice", "DeviceVehicleRelation", "YouweiDevice", "OperationalData",
+    "BrandInfo", "BrandMapping", "FieldDictionary", "DeviceVehicleRelation", "YouweiDevice", "OperationalData",
     # 系统
     "SystemConfig", "DataDictionary", "EventLog",
     # 向量
     "KnowledgeEmbedding",
+    # 规则
+    "KeywordRule",
 ]

@@ -1,6 +1,6 @@
 # 节点5: 数据库查询
 # 通过运营平台接口(batchVehicleInfo)实时查询设备信息 → 字段映射 → 结果格式化
-# 不再使用本地 operational_device 表, 改为调接口 (data_source=platform_api)
+# 实时查询走接口; 本地补充数据保留在 operational_data
 
 from typing import List, Dict, Any, Optional
 from sqlalchemy import select
@@ -67,7 +67,7 @@ async def database_query_with_db(state: WorkflowState, db: AsyncSession) -> Work
             return state
 
         # ============================================
-        # Step 3: 字段映射 + 过滤 (接口返回字段名已对齐 OperationalDevice)
+        # Step 3: 字段映射 + 过滤 (接口返回字段名尽量对齐本地运营字段)
         # ============================================
         # 获取字段字典
         field_stmt = select(FieldDictionary).where(

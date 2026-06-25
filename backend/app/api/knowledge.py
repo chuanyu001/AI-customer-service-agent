@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
 from app.core.database import get_db
-from app.models import KnowledgeAnswer, FAQCard, BrandInfo, KnowledgeQuestionVariant, BUSINESS_KNOWLEDGE_MAP, BUSINESS_FAQ_MAP
+from app.models import BrandInfo, BUSINESS_KNOWLEDGE_MAP, BUSINESS_FAQ_MAP
 from app.schemas.knowledge import (
     KnowledgeCreate, KnowledgeUpdate, KnowledgeDetail, KnowledgeListItem,
     FAQCardItem, FAQCardDetail, BrandItem, ImportResult,
