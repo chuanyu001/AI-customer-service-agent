@@ -59,5 +59,12 @@ frontend/h5-chat/videos/
 *.mov
 *.avi
 
+# 数据库导出 + 数据包 (不进git)
+*.sql
+*_package.zip
+
+# 本地模型文件 (太大, 不进git)
+/models/
+
 # Claude Code 会话配置
 .claude/

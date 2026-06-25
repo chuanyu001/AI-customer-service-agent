@@ -1,14 +1,15 @@
 # 知识库检索服务 (四业务分表版)
 # 按 business_area 路由到对应模型: dashcam/wifi/data/refueling
-# 三层检索: L1精确匹配 → L3大模型全量检索(主) → L2关键词兜底
+# 检索策略: 精确匹配 → 向量检索 → 关键词兜底 → 大模型低置信候选重排
 
 import re
 import logging
-from typing import List, Tuple, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 import jieba
 from sqlalchemy import select, or_, and_, func, text, literal
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from app.core.config import settings
 from app.models import (
     BUSINESS_KNOWLEDGE_MAP,
     BUSINESS_VARIANT_MAP,
@@ -48,7 +49,7 @@ class KnowledgeRetrievalService:
         business_area: str = "dashcam",
         top_k: int = 5,
     ) -> Tuple[List[int], List[float], str]:
-        """三层检索入口
+        """知识问答检索入口.
 
         Returns:
             (knowledge_ids, scores, retrieval_method)
@@ -58,26 +59,101 @@ class KnowledgeRetrievalService:
         if ids and scores and max(scores) >= 0.8:
             return ids, scores, "exact"
 
-        # L3: 大模型全量检索 (主路径)
-        llm_ids = await self._llm_retrieve(db, query, business_area, top_k=5)
-        if llm_ids:
-            return llm_ids, [0.7 * (0.95 ** i) for i in range(len(llm_ids))], "llm_retrieve"
+        # L2: 向量召回 (正常主路径不调用大模型)
+        vector_ids, vector_scores = await self._vector_match(query, business_area)
+        if self._is_confident_vector(vector_scores):
+            return vector_ids[:top_k], vector_scores[:top_k], "vector"
 
-        # L3 失败, 回退 L2 关键词兜底
+        # L3: 关键词兜底, 补强业务术语/短词/型号类命中
         kw_ids, kw_scores = await self._keyword_match(db, query, business_area, top_k)
+        if kw_ids and kw_scores and max(kw_scores) >= 0.75 and not vector_ids:
+            return kw_ids, kw_scores, "keyword"
+
+        # L4: 低置信候选重排. 只给大模型 topK 候选, 不再传全量知识库。
+        candidates = self._merge_candidates(
+            vector_ids,
+            vector_scores,
+            kw_ids,
+            kw_scores,
+            limit=settings.VECTOR_TOP_K,
+        )
+        if candidates and settings.ENABLE_LLM_RERANK:
+            reranked = await self._llm_rerank(db, query, business_area, [kid for kid, _ in candidates], top_k)
+            if reranked:
+                return reranked, [0.66 * (0.95 ** i) for i in range(len(reranked))], "llm_rerank"
+
+        # 大模型不可用或仍不确定时, 返回可解释的本地候选, 让上游按低置信/连续失败处理。
+        if vector_ids and vector_scores and max(vector_scores) >= settings.VECTOR_LOW_SCORE:
+            return vector_ids[:top_k], vector_scores[:top_k], "vector_low"
         if kw_ids and kw_scores:
             return kw_ids, kw_scores, "keyword"
         return [], [], "none"
 
-    async def _llm_retrieve(
-        self, db: AsyncSession, query: str, business_area: str, top_k: int = 5
+    async def _vector_match(
+        self, query: str, business_area: str
+    ) -> Tuple[List[int], List[float]]:
+        """L2: 语义向量召回."""
+        if not settings.ENABLE_VECTOR_RETRIEVAL:
+            return [], []
+        try:
+            from app.services.embedding_service import embedding_service
+
+            results = await embedding_service.search(
+                query,
+                business_area=business_area,
+                top_k=settings.VECTOR_TOP_K,
+            )
+        except Exception as e:
+            logger.warning("向量检索失败: %s", e)
+            return [], []
+
+        return [kid for kid, _ in results], [score for _, score in results]
+
+    @staticmethod
+    def _is_confident_vector(scores: Sequence[float]) -> bool:
+        """判断向量 top1 是否可以直接采纳."""
+        if not scores:
+            return False
+        top1 = scores[0]
+        top2 = scores[1] if len(scores) > 1 else 0.0
+        return (
+            top1 >= settings.VECTOR_ACCEPT_SCORE
+            and (top1 - top2) >= settings.VECTOR_MARGIN
+        )
+
+    @staticmethod
+    def _merge_candidates(
+        vector_ids: Sequence[int],
+        vector_scores: Sequence[float],
+        keyword_ids: Sequence[int],
+        keyword_scores: Sequence[float],
+        limit: int,
+    ) -> List[Tuple[int, float]]:
+        """合并向量和关键词候选, 保留每个知识的最高本地分."""
+        merged: Dict[int, float] = {}
+        for kid, score in zip(vector_ids, vector_scores):
+            merged[kid] = max(merged.get(kid, 0.0), float(score))
+        for kid, score in zip(keyword_ids, keyword_scores):
+            merged[kid] = max(merged.get(kid, 0.0), float(score))
+        return sorted(merged.items(), key=lambda item: item[1], reverse=True)[:limit]
+
+    async def _llm_rerank(
+        self,
+        db: AsyncSession,
+        query: str,
+        business_area: str,
+        candidate_ids: Sequence[int],
+        top_k: int = 5,
     ) -> List[int]:
-        """L3: 大模型全量检索 — 把该业务所有已发布知识喂给大模型选最相关的 top_k"""
+        """L4: 大模型只在本地候选内重排."""
+        if not candidate_ids:
+            return []
+
         kn, var, kw, att, faq, cat_attr = self._get_models(business_area)
         cat_col = getattr(kn, cat_attr)
 
         stmt = select(kn.id, kn.standard_question, cat_col).where(
-            kn.status == "published",
+            and_(kn.status == "published", kn.id.in_(list(candidate_ids)))
         )
         result = await db.execute(stmt)
         rows = result.all()
@@ -92,9 +168,10 @@ class KnowledgeRetrievalService:
             from app.services.llm_service import get_llm
             llm = get_llm()
             ids = await llm.retrieve(query, candidates)
-            return ids[:top_k] if ids else []
+            candidate_set = set(candidate_ids)
+            return [kid for kid in ids if kid in candidate_set][:top_k] if ids else []
         except Exception as e:
-            logger.warning(f"大模型检索失败: {e}")
+            logger.warning(f"大模型候选重排失败: {e}")
             return []
 
     async def _exact_match(

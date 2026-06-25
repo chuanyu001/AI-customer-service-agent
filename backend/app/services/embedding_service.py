@@ -1,38 +1,82 @@
-# 向量化服务 (火山方舟 Embedding API)
-# 用于知识库语义检索的粗筛召回阶段
-# 仅处理知识库文本, 不处理业务数据
+# 四业务知识库向量化服务
+# 构建期: 预计算已发布知识向量并写入 MySQL
+# 运行期: 启动加载到内存, 按 business_area 做余弦相似度召回
 
-import json
 import hashlib
-from typing import List, Tuple, Optional
+import json
+import logging
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
 import numpy as np
-from sqlalchemy import select
+from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.core.config import settings
-from app.models import KnowledgeAnswer, KnowledgeEmbedding, KnowledgeQuestionVariant
+from app.models import (
+    BUSINESS_KNOWLEDGE_MAP,
+    BUSINESS_KEYWORD_MAP,
+    BUSINESS_VARIANT_MAP,
+    KnowledgeEmbedding,
+)
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class EmbeddingSource:
+    business_area: str
+    source_table: str
+    knowledge_id: int
+    knowledge_code: str
+    source_text: str
+    status: str
+
+
+@dataclass(frozen=True)
+class CachedEmbedding:
+    business_area: str
+    source_table: str
+    knowledge_id: int
+    knowledge_code: str
+    source_text: str
+    vector: np.ndarray
 
 
 class EmbeddingService:
-    """向量化服务 (火山方舟 Embedding API)
+    """本地优先的知识向量服务.
 
-    流程:
-    1. 预计算: 把每条知识的 (标准问题 + 常见问法) 编码成向量, 存 knowledge_embedding 表
-    2. 运行时: 把用户问题编码, 与库内所有向量算余弦相似度, 召回 top_k
-    3. 加载到内存: 启动时全量加载, 避免每次查询都读DB
+    - 只处理知识库文本, 不处理运营事实数据。
+    - 默认使用 sentence-transformers 本地模型。
+    - 保留 volcengine provider 兼容旧配置, 但主路径推荐 local。
     """
 
     def __init__(self):
+        self._model = None
         self._client = None
-        self._model = settings.EMBEDDING_MODEL
-        # 内存缓存: [(knowledge_id, source_text, np.array向量)]
-        self._cache: List[Tuple[int, str, np.ndarray]] = []
+        self._cache: Dict[str, List[CachedEmbedding]] = {}
         self._loaded = False
 
-    def _get_client(self):
-        """惰性创建 OpenAI 兼容客户端 (火山方舟)"""
+    @property
+    def model_name(self) -> str:
+        if settings.EMBEDDING_PROVIDER == "local":
+            return settings.EMBEDDING_LOCAL_PATH or settings.EMBEDDING_MODEL
+        return settings.EMBEDDING_MODEL
+
+    def _get_local_model(self):
+        if self._model is None:
+            from sentence_transformers import SentenceTransformer
+
+            model_path = settings.EMBEDDING_LOCAL_PATH or settings.EMBEDDING_MODEL
+            logger.info("加载本地 embedding 模型: %s", model_path)
+            self._model = SentenceTransformer(model_path, device=settings.EMBEDDING_DEVICE)
+        return self._model
+
+    def _get_volcengine_client(self):
         if self._client is None:
             from openai import OpenAI
             import httpx
+
             self._client = OpenAI(
                 base_url=settings.EMBEDDING_BASE_URL,
                 api_key=settings.LLM_API_KEY,
@@ -41,166 +85,266 @@ class EmbeddingService:
         return self._client
 
     def encode(self, text: str) -> np.ndarray:
-        """编码单条文本 → 向量"""
-        client = self._get_client()
-        resp = client.embeddings.create(model=self._model, input=text)
-        vec = resp.data[0].embedding
-        return np.array(vec, dtype=np.float32)
+        """编码单条文本为 L2 归一化向量."""
+        return self.encode_batch([text])[0]
 
-    def encode_batch(self, texts: List[str]) -> np.ndarray:
-        """批量编码 (火山方舟单次最多2048条, 这里分批)"""
-        client = self._get_client()
+    def encode_batch(self, texts: Sequence[str]) -> np.ndarray:
+        """批量编码文本为 L2 归一化向量."""
+        if not texts:
+            return np.empty((0, 0), dtype=np.float32)
+
+        if settings.EMBEDDING_PROVIDER == "volcengine":
+            vectors = self._encode_batch_volcengine(texts)
+        else:
+            model = self._get_local_model()
+            vectors = model.encode(
+                list(texts),
+                batch_size=settings.EMBEDDING_BATCH_SIZE,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
+
+        vectors = np.asarray(vectors, dtype=np.float32)
+        return np.vstack([self._normalize(v) for v in vectors])
+
+    def _encode_batch_volcengine(self, texts: Sequence[str]) -> np.ndarray:
+        client = self._get_volcengine_client()
         all_vecs = []
-        batch_size = 64
+        batch_size = max(settings.EMBEDDING_BATCH_SIZE, 1)
         for i in range(0, len(texts), batch_size):
-            batch = texts[i:i + batch_size]
-            resp = client.embeddings.create(model=self._model, input=batch)
-            # 按 index 排序确保顺序
+            batch = list(texts[i:i + batch_size])
+            resp = client.embeddings.create(model=settings.EMBEDDING_MODEL, input=batch)
             resp.data.sort(key=lambda x: x.index)
-            for d in resp.data:
-                all_vecs.append(np.array(d.embedding, dtype=np.float32))
-        return np.array(all_vecs)
+            all_vecs.extend(np.array(d.embedding, dtype=np.float32) for d in resp.data)
+        return np.asarray(all_vecs, dtype=np.float32)
 
     @staticmethod
-    def _build_source_text(question: str, variants: List[str]) -> str:
-        """拼接参与向量计算的源文本: 标准问题 + 常见问法"""
-        parts = [question] + [v for v in variants if v]
-        return " ".join(parts)
+    def _normalize(vec: np.ndarray) -> np.ndarray:
+        norm = np.linalg.norm(vec)
+        return vec / norm if norm > 0 else vec
 
     @staticmethod
     def _hash_text(text: str) -> str:
         return hashlib.md5(text.encode("utf-8")).hexdigest()
 
     @staticmethod
-    def _normalize(vec: np.ndarray) -> np.ndarray:
-        """L2归一化 (归一化后点积=余弦相似度)"""
-        norm = np.linalg.norm(vec)
-        if norm > 0:
-            return vec / norm
-        return vec
+    def _dedupe(parts: Iterable[Optional[str]]) -> List[str]:
+        seen = set()
+        result = []
+        for part in parts:
+            text = (part or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            result.append(text)
+        return result
 
-    # ============================================
-    # 预计算 (脚本调用)
-    # ============================================
+    @classmethod
+    def build_source_text(
+        cls,
+        *,
+        standard_question: str,
+        category: Optional[str] = None,
+        manufacturer: Optional[str] = None,
+        common_phrasings: Optional[str] = None,
+        variants: Optional[Sequence[str]] = None,
+        keywords: Optional[Sequence[str]] = None,
+    ) -> str:
+        """拼接参与向量计算的检索文本.
 
-    async def build_all_embeddings(self, db: AsyncSession, force: bool = False) -> dict:
-        """预计算所有已发布知识的向量并入库
-
-        Args:
-            force: True=强制重算所有; False=只算新增/变更的
+        不拼完整答案, 避免答案里的泛化表述污染语义召回。
         """
-        stmt = select(KnowledgeAnswer).where(
-            KnowledgeAnswer.status == "published",
-            KnowledgeAnswer.business_area == "dashcam",
-        )
-        result = await db.execute(stmt)
-        knowledges = result.scalars().all()
+        parts: List[Optional[str]] = [
+            standard_question,
+            category,
+            manufacturer,
+            common_phrasings,
+        ]
+        parts.extend(variants or [])
+        parts.extend(keywords or [])
+        return " ".join(cls._dedupe(parts))
 
-        if not knowledges:
+    async def _collect_sources(
+        self,
+        db: AsyncSession,
+        business_area: Optional[str] = None,
+    ) -> List[EmbeddingSource]:
+        areas = [business_area] if business_area else list(BUSINESS_KNOWLEDGE_MAP.keys())
+        sources: List[EmbeddingSource] = []
+
+        for area in areas:
+            kn = BUSINESS_KNOWLEDGE_MAP.get(area)
+            var = BUSINESS_VARIANT_MAP.get(area)
+            kw = BUSINESS_KEYWORD_MAP.get(area)
+            if kn is None:
+                continue
+
+            result = await db.execute(select(kn).where(kn.status == "published"))
+            knowledges = list(result.scalars().all())
+            if not knowledges:
+                continue
+
+            knowledge_ids = [k.id for k in knowledges]
+            variants_by_id: Dict[int, List[str]] = {}
+            keywords_by_id: Dict[int, List[str]] = {}
+
+            if var is not None:
+                var_result = await db.execute(
+                    select(var).where(
+                        and_(var.knowledge_id.in_(knowledge_ids), var.is_active == True)
+                    )
+                )
+                for row in var_result.scalars().all():
+                    variants_by_id.setdefault(row.knowledge_id, []).append(row.variant_text)
+
+            if kw is not None:
+                kw_result = await db.execute(select(kw).where(kw.knowledge_id.in_(knowledge_ids)))
+                for row in kw_result.scalars().all():
+                    keywords_by_id.setdefault(row.knowledge_id, []).append(row.keyword)
+
+            for k in knowledges:
+                category = getattr(k, "category_l2", None) or getattr(k, "category", None)
+                source_text = self.build_source_text(
+                    standard_question=k.standard_question,
+                    category=category,
+                    manufacturer=getattr(k, "manufacturer", None),
+                    common_phrasings=getattr(k, "common_phrasings", None),
+                    variants=variants_by_id.get(k.id, []),
+                    keywords=keywords_by_id.get(k.id, []),
+                )
+                if not source_text:
+                    continue
+                sources.append(EmbeddingSource(
+                    business_area=area,
+                    source_table=kn.__tablename__,
+                    knowledge_id=k.id,
+                    knowledge_code=k.knowledge_code,
+                    source_text=source_text,
+                    status=k.status,
+                ))
+
+        return sources
+
+    async def build_all_embeddings(
+        self,
+        db: AsyncSession,
+        force: bool = False,
+        business_area: Optional[str] = None,
+    ) -> dict:
+        """预计算四业务已发布知识向量并写入 MySQL."""
+        sources = await self._collect_sources(db, business_area=business_area)
+        if not sources:
             return {"total": 0, "computed": 0, "skipped": 0}
 
-        kid_list = [k.id for k in knowledges]
-        var_stmt = select(KnowledgeQuestionVariant).where(
-            KnowledgeQuestionVariant.knowledge_id.in_(kid_list),
-            KnowledgeQuestionVariant.is_active == True,
-        )
-        var_result = await db.execute(var_stmt)
-        variants_by_kid = {}
-        for v in var_result.scalars().all():
-            variants_by_kid.setdefault(v.knowledge_id, []).append(v.variant_text)
+        existing_stmt = select(KnowledgeEmbedding)
+        if business_area:
+            existing_stmt = existing_stmt.where(KnowledgeEmbedding.business_area == business_area)
+        existing_result = await db.execute(existing_stmt)
+        existing = {
+            (e.business_area, e.source_table, e.knowledge_id): e
+            for e in existing_result.scalars().all()
+        }
 
-        emb_stmt = select(KnowledgeEmbedding).where(
-            KnowledgeEmbedding.knowledge_id.in_(kid_list)
-        )
-        emb_result = await db.execute(emb_stmt)
-        existing = {e.knowledge_id: e for e in emb_result.scalars().all()}
-
-        computed = 0
+        to_encode: List[Tuple[EmbeddingSource, str]] = []
         skipped = 0
-        to_encode = []
-        for k in knowledges:
-            source = self._build_source_text(k.standard_question, variants_by_kid.get(k.id, []))
-            h = self._hash_text(source)
-            if not force and k.id in existing and existing[k.id].text_hash == h:
+        for source in sources:
+            text_hash = self._hash_text(source.source_text)
+            key = (source.business_area, source.source_table, source.knowledge_id)
+            old = existing.get(key)
+            if not force and old and old.text_hash == text_hash and old.model_name == self.model_name:
                 skipped += 1
                 continue
-            to_encode.append((k, source))
+            to_encode.append((source, text_hash))
 
+        computed = 0
         if to_encode:
-            texts = [s for _, s in to_encode]
-            vecs = self.encode_batch(texts)
-
-            for (k, source), vec in zip(to_encode, vecs):
-                h = self._hash_text(source)
-                vec_json = json.dumps(vec.tolist())
-                if k.id in existing:
-                    existing[k.id].text_hash = h
-                    existing[k.id].source_text = source
-                    existing[k.id].embedding = vec_json
-                    existing[k.id].dim = len(vec)
-                    existing[k.id].model_name = self._model
+            vectors = self.encode_batch([source.source_text for source, _ in to_encode])
+            for (source, text_hash), vec in zip(to_encode, vectors):
+                key = (source.business_area, source.source_table, source.knowledge_id)
+                payload = json.dumps(vec.tolist(), ensure_ascii=False)
+                old = existing.get(key)
+                if old:
+                    old.knowledge_code = source.knowledge_code
+                    old.text_hash = text_hash
+                    old.source_text = source.source_text
+                    old.embedding = payload
+                    old.model_name = self.model_name
+                    old.dim = len(vec)
+                    old.status = source.status
                 else:
                     db.add(KnowledgeEmbedding(
-                        knowledge_id=k.id,
-                        text_hash=h,
-                        source_text=source,
-                        embedding=vec_json,
-                        model_name=self._model,
+                        business_area=source.business_area,
+                        source_table=source.source_table,
+                        knowledge_id=source.knowledge_id,
+                        knowledge_code=source.knowledge_code,
+                        text_hash=text_hash,
+                        source_text=source.source_text,
+                        embedding=payload,
+                        model_name=self.model_name,
                         dim=len(vec),
+                        status=source.status,
                     ))
                 computed += 1
 
         await db.commit()
-        return {"total": len(knowledges), "computed": computed, "skipped": skipped}
-
-    # ============================================
-    # 内存加载 (启动时)
-    # ============================================
+        return {"total": len(sources), "computed": computed, "skipped": skipped}
 
     async def load_to_memory(self, db: AsyncSession) -> int:
-        """把所有向量加载到内存 (服务启动时调用一次)"""
-        stmt = select(KnowledgeEmbedding, KnowledgeAnswer).join(
-            KnowledgeAnswer, KnowledgeEmbedding.knowledge_id == KnowledgeAnswer.id
-        ).where(
-            KnowledgeAnswer.status == "published",
+        """加载已发布向量到内存."""
+        result = await db.execute(
+            select(KnowledgeEmbedding).where(KnowledgeEmbedding.status == "published")
         )
-        result = await db.execute(stmt)
-        rows = result.all()
+        rows = result.scalars().all()
 
-        self._cache = []
-        for emb, k in rows:
+        cache: Dict[str, List[CachedEmbedding]] = {}
+        for row in rows:
             try:
-                vec = np.array(json.loads(emb.embedding), dtype=np.float32)
+                vec = np.array(json.loads(row.embedding), dtype=np.float32)
                 vec = self._normalize(vec)
-                self._cache.append((k.id, k.standard_question, vec))
-            except (json.JSONDecodeError, ValueError):
+            except (TypeError, ValueError, json.JSONDecodeError):
+                logger.warning("跳过损坏向量: area=%s kid=%s", row.business_area, row.knowledge_id)
                 continue
+            cache.setdefault(row.business_area, []).append(CachedEmbedding(
+                business_area=row.business_area,
+                source_table=row.source_table,
+                knowledge_id=row.knowledge_id,
+                knowledge_code=row.knowledge_code,
+                source_text=row.source_text or "",
+                vector=vec,
+            ))
 
+        self._cache = cache
         self._loaded = True
-        return len(self._cache)
+        return sum(len(items) for items in cache.values())
 
-    # ============================================
-    # 向量召回 (运行时)
-    # ============================================
-
-    async def search(self, query: str, top_k: int = 10) -> List[Tuple[int, float]]:
-        """向量召回 top_k
-
-        Returns:
-            [(knowledge_id, score), ...] 按相似度降序
-        """
-        if not self._cache:
+    async def search(
+        self,
+        query: str,
+        business_area: str,
+        top_k: Optional[int] = None,
+    ) -> List[Tuple[int, float]]:
+        """按业务域向量召回 top_k, 返回 [(knowledge_id, score)]."""
+        if not settings.ENABLE_VECTOR_RETRIEVAL:
             return []
 
-        query_vec = self._normalize(self.encode(query))
-        scores = []
-        for kid, _text, vec in self._cache:
-            score = float(np.dot(query_vec, vec))
-            scores.append((kid, score))
+        records = self._cache.get(business_area, [])
+        if not records:
+            return []
 
-        scores.sort(key=lambda x: x[1], reverse=True)
-        return scores[:top_k]
+        try:
+            query_vec = self.encode(query)
+        except Exception as e:
+            logger.warning("查询向量生成失败, 跳过向量检索: %s", e)
+            return []
+
+        limit = top_k or settings.VECTOR_TOP_K
+        scored = [
+            (record.knowledge_id, float(np.dot(query_vec, record.vector)))
+            for record in records
+        ]
+        scored.sort(key=lambda item: item[1], reverse=True)
+        return scored[:limit]
 
 
-# 全局单例
 embedding_service = EmbeddingService()

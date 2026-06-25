@@ -542,21 +542,16 @@ async def send_message(
     # ============================================
     # Step 4: 运行简化版工作流 (不使用LangGraph runtime, 直接调用)
     # ============================================
-    llm = get_llm()
+    # 4.1 规则优先意图识别: 正常主路径不再调用大模型分类
+    from app.nodes.query_judgment import _match_query_type
 
-    # 4.1 意图识别
-    try:
-        result = await llm.classify(
-            text=req.content,
-            labels=INTENT_LABELS,
-            context="",
-        )
-        intent_type = result.get("label", "unknown")
-        intent_confidence = result.get("confidence", 0.0)
-    except Exception as e:
-        intent_type = "unknown"
-        intent_confidence = 0.0
-        logger.warning(f"意图识别失败 query='{req.content}': {e}")
+    qtype = _match_query_type(req.content)
+    if qtype and _should_route_live_query(req.content, qtype):
+        intent_type = "live_query"
+        intent_confidence = 0.9
+    else:
+        intent_type = "knowledge_query"
+        intent_confidence = 0.75
 
     logger.info(f"[意图识别] query='{req.content}' -> intent={intent_type} conf={intent_confidence:.2f}")
 
@@ -582,6 +577,44 @@ async def send_message(
             # 获取最佳匹配
             best = await knowledge_service.get_knowledge_by_id(db, matched_ids[0], req.business_area)
             if best:
+                # 高风险知识条目不直接对客, 进入人工处理
+                if getattr(best, "risk_level", "low") == "high":
+                    reason = f"命中高风险知识: {best.knowledge_code}"
+                    await session_service.update_conversation_status(
+                        db, session_id, "transferred",
+                        transfer_count=(conv.transfer_count or 0) + 1,
+                    )
+                    await session_service.create_handoff_ticket(
+                        db=db,
+                        session_id=session_id,
+                        reason_type="risk",
+                        reason_detail=reason,
+                        priority="urgent",
+                    )
+                    ai_msg = await session_service.add_message(
+                        db=db,
+                        conversation_id=conv.id,
+                        role="assistant",
+                        content="您的问题需要人工客服进一步处理，正在为您转接人工客服，请稍候...",
+                        action="transfer",
+                        reply_type="handoff",
+                        knowledge_id=best.id,
+                        knowledge_code=best.knowledge_code,
+                        intent_result={"intent": intent_type, "confidence": intent_confidence, "method": method},
+                    )
+                    await db.commit()
+                    return BaseResponse(
+                        data=ChatMessageResponse(
+                            session_id=session_id,
+                            message_id=ai_msg.message_id,
+                            seq=ai_msg.seq,
+                            content=ai_msg.content,
+                            response_type="transfer",
+                            should_transfer=True,
+                            evaluation_prompt="感谢您的耐心等待, 人工客服将尽快为您服务。",
+                        ).model_dump()
+                    )
+
                 # 是否对客判断: 命中转人工类知识 → 先用追问语收集信息, 下一轮转人工
                 if not getattr(best, "auto_reply", True):
                     transfer_prompt = getattr(best, "transfer_prompt", "") or (
@@ -702,10 +735,7 @@ async def send_message(
 
     # 4.3 查询意图
     if intent_type == "live_query":
-        from app.nodes.query_judgment import _match_query_type
         from app.integrations.platform_client import platform_client
-
-        qtype = _match_query_type(req.content)
 
         # 先尝试从用户消息提取 VIN (运营平台接口仅支持 VIN 查询)
         vin = _extract_vin(req.content)
@@ -854,6 +884,40 @@ def _extract_vin(text: str) -> Optional[str]:
         return None
     m = re.search(r"[A-HJ-NPR-Z0-9]{17}", text.upper())
     return m.group(0) if m else None
+
+
+def _should_route_live_query(text: str, query_type_code: str) -> bool:
+    """区分"怎么查"教程类问题和"帮我查"本人设备数据问题.
+
+    query_judgment 的关键词能识别 13 类查询类型, 但像"怎么查询SIM卡号"
+    应走知识库教程, 而不是要求用户提供 VIN。只有用户明显在查自己设备
+    的事实数据时才进入运营平台查询分支。
+    """
+    if _extract_vin(text):
+        return True
+
+    t = (text or "").lower()
+    instructional_markers = [
+        "怎么", "如何", "怎样", "在哪", "哪里", "方法", "步骤", "教程",
+        "操作", "查看方式", "查询方式", "怎么查询", "如何查询",
+    ]
+    personal_query_markers = [
+        "我的", "我这", "这台", "这辆", "本车", "帮我查", "查一下", "查询一下",
+        "是多少", "多少", "是什么", "到期了吗", "什么时候到期", "到期时间",
+        "在线吗", "离线了吗", "状态", "哪家", "哪个服务商", "谁负责",
+    ]
+
+    if any(marker in t for marker in personal_query_markers):
+        return True
+
+    if any(marker in t for marker in instructional_markers):
+        return False
+
+    # 缴费/激活/开通类容易涉及业务操作, 没有个人设备标识时先交给知识库解释流程。
+    if query_type_code == "QRY009":
+        return False
+
+    return False
 
 
 def _is_unknown_brand_response(text: str) -> bool:

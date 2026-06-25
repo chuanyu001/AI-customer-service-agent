@@ -1,7 +1,7 @@
 # AI智能客服Agent — 产品实施方案（进度更新版）
 
-> 更新日期：2026-06-24
-> 状态：**品牌识别双因子(VIN+终端号) + VIN主动识别 + 四业务知识库全量更新**，行车记录仪全链路可用
+> 更新日期：2026-06-25
+> 状态：**向量语义检索上线 + 规则化意图识别 + 本地Embedding模型**，四业务172条知识全量向量化
 
 ---
 
@@ -15,7 +15,7 @@
 - 四业务知识库已全部导入数据库（dashcam 144 / wifi 9 / data 11 / refueling 8 / youwei_device 10010）
 - 每条知识标记「是否对客」（对客/转人工），转人工类知识命中后先追问收集信息再转人工，转人工工单携带完整对话上下文给坐席
 
-**当前实际进度**：四业务知识库全量导入 + 「是否对客」转人工机制（转人工前追问 + 工单带完整上下文）已上线；行车记录仪业务的「意图识别→知识检索→品牌追问→回复生成→转人工」全链路已跑通，前端 H5 页面可对话，大模型已接入火山方舟豆包。
+**当前实际进度**：四业务知识库全量导入 + 向量语义检索 + 规则化意图识别已上线；行车记录仪业务全链路跑通，前端 H5 可对话。
 
 ---
 
@@ -45,6 +45,10 @@
 | VIN主动品牌识别 | ✅ | 用户直接发纯VIN时，dashcam业务主动查品牌返回，不依赖pending上下文（见§2.8） |
 | 有为设备全量导入 | ✅ | youwei_device表导入10010台明细，终端号→品牌查表即得 |
 | 多业务知识库全量更新 | ✅ | WiFi 9/Data 11/Refueling 8，全量替换导入，对齐6.24确认版Excel |
+| 向量语义检索 | ✅ | 本地 BAAI/bge-small-zh-v1.5 模型，四业务172条知识全量向量化，内存余弦召回（见§2.10） |
+| 检索策略升级 | ✅ | 精确匹配→向量召回→关键词兜底→大模型仅对候选重排，不再传全量知识库 |
+| 意图识别规则化 | ✅ | 规则优先区分教程类 vs 个人数据查询，不再每条消息调LLM分类（见§2.11） |
+| 本地Embedding模型 | ✅ | models/bge-small-zh-v1.5，512维，~192MB，启动加载到内存 |
 
 ### 待完成 ⏳
 
@@ -308,15 +312,73 @@ Step 3.5 (NEW): dashcam业务 + 无pending + 纯VIN消息
 
 **特点**：不依赖 pending 上下文，即使会话变了也能工作。
 
+### 10. 向量语义检索：本地Embedding模型 + 内存召回
+
+**问题**：之前的"大模型全量检索"每次把全量知识库（144条）发给豆包选 top5，慢（+3-5秒）且贵（每次几千 tokens）。
+
+**方案**：用本地 `BAAI/bge-small-zh-v1.5` 模型把知识条目预计算为 512 维向量，启动时加载到内存，用户问题同模型向量化后做余弦相似度召回。
+
+**实现**：
+
+```
+启动时
+  ↓
+load_to_memory(): 从 business_knowledge_embedding 表读172条向量到内存
+  ↓
+用户问题 → encode(query) → 与内存向量矩阵做 dot product
+  ↓
+topK 召回 → 按分数阈值分流:
+  ├── top1 ≥ 0.62 + margin ≥ 0.05 → 直接采纳 (vector)
+  ├── 0.55 ≤ top1 < 0.62 → 合并关键词候选 → LLM对候选重排 (llm_rerank)
+  └── top1 < 0.55 → 关键词兜底 (keyword)
+```
+
+**新检索链路**（`knowledge_service.py`）：
+
+```
+L1 精确匹配 → L2 向量召回 → L3 关键词兜底 → L4 LLM候选重排
+```
+
+**关键参数**（`.env` 可调）：
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| `VECTOR_ACCEPT_SCORE` | 0.62 | 高于此分+margin可直采 |
+| `VECTOR_LOW_SCORE` | 0.55 | 低于此分转关键词 |
+| `VECTOR_MARGIN` | 0.05 | top1与top2的最小分差 |
+| `ENABLE_LLM_RERANK` | true | 低置信时是否调LLM重排 |
+
+**source_text 构建**：拼接 standard_question + category + manufacturer + common_phrasings + variants + keywords，**不拼完整答案**，避免答案中"请先检查SIM卡"等泛化表述污染检索语义。
+
+**性能**：向量召回 + 余弦计算 < 50ms（512维×172条），远快于之前的 LLM 全量检索（3-5秒）。
+
+### 11. 意图识别规则化
+
+**问题**：之前每条消息调豆包做意图分类（knowledge_query / live_query / unknown），增加 2-3 秒延迟，且对简单问法也可能分错。
+
+**方案**：用规则替代大模型做意图分类。`_should_route_live_query()` 函数判断用户是在问**教程**（走知识库）还是**查本人数据**（走运营平台接口）。
+
+**规则**：
+
+```
+含 VIN → live_query
+含个人标记 ("我的"/"帮我查"/"到期了吗"/"在线吗"...) → live_query
+含教程标记 ("怎么"/"如何"/"方法"/"步骤"...) → knowledge_query
+QRY009 (续费/缴费) → knowledge_query (强制走知识库)
+其他 → knowledge_query (默认)
+```
+
+**效果**：每条消息省 1 次 LLM 调用（约 2-3 秒），意图分类延迟从 2-3 秒降到 < 1ms。
+
 ---
 
-## 四、数据库设计（21张表，已建好）
+## 四、数据库设计（22张表，已建好）
 
 | 表组 | 表 | 状态 |
 |---|---|---|
-| **知识数据** | knowledge_answer(144) / question_variant(415) / keyword(914) / attachment / version / faq_card(10) / query_intent_config(13) | ✅已导入 |
-| **业务事实** | brand_info(7) / brand_mapping / field_dictionary(22) / youwei_device(10010) / operational_device(保留空表) / device_vehicle_relation | ✅品牌识别双因子 |
-| **运行数据** | conversation(93测试会话) / message(155) / answer_feedback / handoff_ticket / optimization_sample | ✅ |
+| **四业务知识分表** | dashcam_/wifi_/data_/refueling_ knowledge+variant+keyword+(attachment)+faq_card | ✅四业务全量导入 |
+| **知识向量** | business_knowledge_embedding(172) | ✅本地模型向量化 |
+| **业务事实** | brand_info(7) / brand_mapping / field_dictionary(22) / youwei_device(10010) / operational_data(360k) / operational_device(保留空表) | ✅品牌双因子 |
+| **运行数据** | conversation / message / answer_feedback / handoff_ticket / optimization_sample | ✅ |
 | **系统配置** | system_config(14) / data_dictionary(26) / event_log | ✅ |
 
 ---

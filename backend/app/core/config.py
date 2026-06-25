@@ -77,13 +77,22 @@ class Settings(BaseSettings):
     # ============================================
     # 向量化
     # ============================================
-    # provider=volcengine 用火山方舟 Embedding API (复用 LLM_API_KEY)
-    # provider=local 用本地 sentence-transformers (需可访问 huggingface)
-    EMBEDDING_PROVIDER: str = "volcengine"
-    EMBEDDING_MODEL: str = "doubao-embedding-text-240715"
+    # provider=local 用本地 sentence-transformers; volcengine 保留兼容旧方案
+    EMBEDDING_PROVIDER: str = "local"
+    EMBEDDING_MODEL: str = "BAAI/bge-small-zh-v1.5"
+    EMBEDDING_LOCAL_PATH: str = ""
     EMBEDDING_DEVICE: str = "cpu"
+    EMBEDDING_BATCH_SIZE: int = 64
     # 火山方舟 embedding 接口地址 (一般与 LLM_BASE_URL 同源)
     EMBEDDING_BASE_URL: str = "https://ark.cn-beijing.volces.com/api/v3"
+
+    # 向量检索
+    ENABLE_VECTOR_RETRIEVAL: bool = True
+    VECTOR_TOP_K: int = 10
+    VECTOR_ACCEPT_SCORE: float = 0.62
+    VECTOR_LOW_SCORE: float = 0.55
+    VECTOR_MARGIN: float = 0.05
+    ENABLE_LLM_RERANK: bool = True
 
     # ============================================
     # 七鱼客服
@@ -103,7 +112,7 @@ class Settings(BaseSettings):
     MAX_SLOT_RETRY: int = 2
 
     # 回复润色: 大模型对知识库答案做受限润色(只调格式/语气, 不改内容)
-    ENABLE_POLISH: bool = True
+    ENABLE_POLISH: bool = False
 
     # ============================================
     # 运营平台接口 (实时查询设备信息)

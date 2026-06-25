@@ -11,6 +11,7 @@ from app.core.config import settings
 from app.core.database import init_db, close_db
 from app.core.redis_client import close_redis
 from app.api import chat, knowledge, evaluation, admin
+from app.services.embedding_service import embedding_service
 
 # 日志配置
 logging.basicConfig(
@@ -31,6 +32,8 @@ async def lifespan(app: FastAPI):
     try:
         await init_db()
         logger.info("✅ 数据库初始化完成")
+        loaded = await _load_embeddings()
+        logger.info("✅ 知识向量缓存加载完成: %s 条", loaded)
     except Exception as e:
         logger.warning(f"⚠️ 数据库初始化失败 (可手动运行 scripts/init_db.py): {e}")
 
@@ -66,6 +69,19 @@ app.include_router(chat.router, prefix="/api/v1")
 app.include_router(knowledge.router, prefix="/api/v1")
 app.include_router(evaluation.router, prefix="/api/v1")
 app.include_router(admin.router, prefix="/api/v1")
+
+
+async def _load_embeddings() -> int:
+    """启动时加载已预计算向量; 加载失败不阻断服务."""
+    try:
+        from app.core.database import get_session_factory
+
+        factory = get_session_factory()
+        async with factory() as db:
+            return await embedding_service.load_to_memory(db)
+    except Exception as e:
+        logger.warning("知识向量缓存加载失败, 将跳过向量检索: %s", e)
+        return 0
 
 
 # ============================================

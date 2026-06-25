@@ -4,8 +4,9 @@
 
 ## ✨ 核心特性
 
-- **大模型驱动的语义检索**：火山方舟豆包做意图分类 + 知识检索，理解口语化提问，按业务域路由分表
-- **品牌识别双因子**：VIN+终端号(行车记录仪ID)联合识别，终端号规则优先，VIN交叉验证，5品牌各有确定规则
+- **本地向量语义检索**：BAAI/bge-small-zh-v1.5 模型，四业务172条知识向量化，内存余弦召回 < 50ms
+- **规则化意图识别**：区分教程类 vs 个人数据查询，不再每条消息调大模型分类
+- **品牌识别双因子**：VIN+终端号(行车记录仪ID)联合识别，终端号规则优先，VIN交叉验证
 - **VIN主动品牌识别**：用户直接发纯VIN时，dashcam业务主动查品牌返回，不依赖多轮上下文
 - **品牌识别追问**：命中需品牌的知识时主动追问，多轮上下文衔接，选品牌后返回该品牌详细答案
 - **是否对客转人工**：每条知识标记对客/转人工，转人工类命中先追问收集信息（VIN/ICCID/车型）再转人工，工单携带完整对话上下文给坐席
@@ -21,7 +22,8 @@
 | 后端 | Python 3.13 / FastAPI / LangGraph |
 | 数据库 | MySQL 8.0 (异步 SQLAlchemy + aiomysql) |
 | 大模型 | 火山方舟豆包 (OpenAI兼容接口) |
-| 知识检索 | jieba分词 + 大模型全量检索 + SQL精确匹配 |
+| Embedding | 本地 BAAI/bge-small-zh-v1.5 (512维, 192MB) |
+| 知识检索 | 精确匹配 → 向量余弦召回 → 关键词兜底 → LLM候选重排 |
 | 前端 | 原生 HTML/CSS/JS (移动端H5) |
 
 ## 🏗 架构
@@ -42,8 +44,8 @@
   ├─ ① 多轮上下文检查 (上一轮追问品牌/转人工收集信息→衔接)
   ├─ ② 快速通道 (转人工/高风险/问候语, 不调大模型)
   ├─ ③ VIN主动品牌识别 (dashcam+纯VIN→双因子查品牌→返回+存pending)
-  ├─ ④ 意图分类 (大模型: knowledge_query/live_query/unknown)
-  ├─ ⑤ 知识检索 (L1精确→L3大模型全量→L2关键词兜底, 按业务域分表)
+  ├─ ④ 意图分类 (规则优先: 教程走知识库 / 个人数据走接口查询)
+  ├─ ⑤ 知识检索 (L1精确→L2向量召回→L3关键词→L4 LLM候选重排)
   ├─ ⑥ 品牌感知 (need_brand=1→追问品牌; 已指定→返该品牌)
   ├─ ⑦ 是否对客判断 (auto_reply=True→自动答; =False→追问收集信息→转人工)
   ├─ ⑧ 查询意图 (live_query→提取VIN→调运营平台接口→返回)
@@ -82,8 +84,9 @@ python scripts/migrate_to_multi_table.py
 # 导入/更新四业务知识库 + 有为设备明细 (全量替换策略)
 python scripts/import_multi_business.py
 
-# 导入种子数据 (FAQ卡片/系统配置/数据字典)
+# 导入种子数据 + 构建向量索引
 python scripts/seed_data.py
+python scripts/build_embeddings.py
 ```
 
 ### 3. 配置火山方舟大模型
@@ -134,8 +137,9 @@ AI customer service agent/
 
 | 表组 | 表 | 说明 |
 |------|------|------|
-| 四业务知识分表 | dashcam_/wifi_/data_/refueling_ knowledge+variant+keyword+(attachment)+faq_card | 运行时检索用，各业务独立分表，knowledge表含 auto_reply(对客/转人工) + transfer_prompt(追问语) |
-| 知识数据(旧) | knowledge_answer, question_variant, keyword, attachment, version, faq_card, query_intent_config, knowledge_embedding | 迁移前备份+向量索引+查询意图配置 |
+| 四业务知识分表 | dashcam_/wifi_/data_/refueling_ knowledge+variant+keyword+(attachment)+faq_card | 运行时检索用，各业务独立分表 |
+| 知识向量 | business_knowledge_embedding(172) | 四业务知识向量存储，启动加载内存 |
+| 知识数据(旧) | knowledge_answer, question_variant, keyword, attachment, version, faq_card, query_intent_config | 迁移前备份+查询意图配置 |
 | 业务事实 | brand_info, brand_mapping, field_dictionary, youwei_device(10010), operational_device, device_vehicle_relation | 品牌双因子识别/字段字典/有为设备明细/设备关系 |
 | 运行数据 | conversation, message, answer_feedback, handoff_ticket, optimization_sample | 会话/消息/评价/工单(带完整上下文)/样本 |
 | 系统配置 | system_config, data_dictionary, event_log | 配置/字典/日志 |
@@ -158,16 +162,19 @@ AI customer service agent/
 
 ## 📊 当前进度
 
-- ✅ 行车记录仪业务全链路跑通（知识问答/品牌追问/转人工）
-- ✅ 品牌识别双因子（VIN+终端号联合识别，终端号规则优先）
-- ✅ VIN主动品牌识别（纯VIN消息主动查品牌，不依赖多轮上下文）
-- ✅ 四业务知识库全量导入（dashcam 144/wifi 9/data 11/refueling 8，含是否对客标记）
-- ✅ 有为设备10010台明细导入（youwei_device表，品牌查表即得）
+- ✅ 行车记录仪业务全链路跑通
+- ✅ 本地向量语义检索（BAAI/bge-small-zh-v1.5，172条全量向量化，< 50ms）
+- ✅ 规则化意图识别（不再每条消息调LLM分类，省2-3秒）
+- ✅ 检索策略升级（精确→向量→关键词→LLM候选重排，LLM不再看全量知识库）
+- ✅ 品牌识别双因子（VIN+终端号联合识别）
+- ✅ VIN主动品牌识别（纯VIN消息主动查品牌）
+- ✅ 四业务知识库全量导入（dashcam 144/wifi 9/data 11/refueling 8）
+- ✅ 有为设备10010台明细导入
 - ✅ 「是否对客」转人工机制（转人工前追问 + 工单带完整上下文）
-- ✅ 运营平台接口实时查询（batchVehicleInfo，VIN→车牌/设备号/到期）
+- ✅ 运营平台接口实时查询
 - ✅ 火山方舟大模型接入
 - ✅ H5前端页面
-- ⏳ 运营平台接口扩展（在线状态/SIM/套餐等待补其他接口）
+- ⏳ 运营平台接口扩展（在线状态/SIM/套餐）
 - ⏳ 多业务路由端到端验证
 - ⏳ 七鱼工单对接
 
