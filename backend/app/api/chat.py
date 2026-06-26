@@ -225,29 +225,9 @@ async def send_message(
                         evaluation_prompt="这个回答有帮助吗?",
                     ).model_dump()
                 )
-        # 未识别出品牌
-        # 检查用户是否说"不知道/不清楚" → 转VIN追问做两级识别
-        if _is_unknown_brand_response(req.content):
-            await session_service.clear_pending_context(db, session_id)
-            category_l2 = pending.get("category_l2", "")
-            await session_service.set_pending_context(db, session_id, {
-                "type": "vin_for_brand",
-                "category_l2": category_l2,
-            })
-            ai_msg = await session_service.add_message(
-                db=db, conversation_id=conv.id, role="assistant",
-                content="没关系, 请提供您的车架号(VIN), 我帮您查询设备品牌。",
-                action="ask_info", reply_type="vin_for_brand",
-                intent_result={"intent": "knowledge_query", "via": "brand_unknown"},
-            )
-            await db.commit()
-            return BaseResponse(data=ChatMessageResponse(
-                session_id=session_id, message_id=ai_msg.message_id, seq=ai_msg.seq,
-                content="没关系, 请提供您的车架号(VIN), 我帮您查询设备品牌。",
-                response_type="ask_slot", need_more_info=True,
-                ask_slot_prompt="请提供车架号(VIN)",
-            ).model_dump())
-        # 既没识别品牌也没说不知道 → 清除pending走正常流程
+        # 未识别出品牌 → 清除pending, 由LLM理解下游继续处理
+        # LLM 会看到上下文（上一轮问了品牌），自动判断用户是"不知道品牌"要VIN
+        # 还是在问一个新问题。不再用硬编码关键词猜测。
         await session_service.clear_pending_context(db, session_id)
 
     # ============================================
@@ -1220,14 +1200,6 @@ async def _build_clarify_prompt(db, query: str, business_area: str) -> str:
             return "抱歉，我没有完全理解您的问题。您能再具体描述一下吗？比如告诉我您遇到的问题是什么、涉及到什么设备或服务。\n\n如需人工协助，请输入转人工。"
     except Exception:
         return "抱歉，我没有完全理解您的问题。您能再具体描述一下吗？\n\n如需人工协助，请输入转人工。"
-
-def _is_unknown_brand_response(text: str) -> bool:
-    """判断用户是否表达"不知道品牌" (触发VIN查品牌)"""
-    if not text:
-        return False
-    t = text.strip()
-    unknown_phrases = ["不知道", "不清楚", "不确定", "不晓得", "忘了", "不记得", "查一下", "帮我查"]
-    return any(p in t for p in unknown_phrases)
 
 
 def _gen_follow_ups(knowledge) -> list:

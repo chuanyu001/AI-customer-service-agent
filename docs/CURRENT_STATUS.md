@@ -15,7 +15,8 @@
 → LLM理解: 最近6条消息 + pending + memory → intent/business/slots/rewritten_query
 → live_query: 收集 VIN 后查运营平台
 → knowledge_query: 原问题精确 → 改写问题精确 → 改写问题向量检索 → 低置信 LLM 重排
-→ 品牌追问/是否对客/转人工工单
+→ 品牌追问: 用户说出品牌→直接返回品牌知识；未说品牌→清除pending交由LLM理解
+→ 删除了 `_is_unknown_brand_response` 硬编码关键词，不再把"查一下"误判为"不知道品牌"
 → 更新当前 session memory
 ```
 
